@@ -30,22 +30,22 @@ COOLDOWN_SECONDS = 60 * 60
 TOP_LIMIT = 10
 
 GROUP_INTRO_TEXT = (
-    "🐦 <b>Angry Копилка</b>\n\n"
+    "<b>🐦 Angry Копилка\n\n"
     "Раз в час можно крутануть копилку и получить силу и монеты.\n\n"
     "🎰 /AngryOpen — крутануть копилку\n"
-    "🏆 /AngryTop — топ силы чата"
+    "🏆 /AngryTop — топ силы чата</b>"
 )
 NON_ADMIN_PRIVATE_TEXT = (
-    "🐦 Привет! Я работаю в группах.\n\n"
-    "Добавь меня в чат и используй там команды /AngryOpen и /AngryTop."
+    "<b>🐦 Привет! Я работаю в группах.\n\n"
+    "Добавь меня в чат и используй там команды /AngryOpen и /AngryTop.</b>"
 )
 
 CARD_FIELDS = ("name", "power", "money", "photo_id", "rarity")
 FIELD_PROMPTS = {
-    "photo_id": "📸 Пришли новое фото карточки",
-    "name": "✏️ Введи новое название карточки",
-    "power": "⚡ Введи новую силу карточки (число)",
-    "money": "💰 Введи новое количество денег (число)",
+    "photo_id": "<b>📸 Пришли новое фото карточки</b>",
+    "name": "<b>✏️ Введи новое название карточки</b>",
+    "power": "<b>⚔️ Введи новую силу карточки (число)</b>",
+    "money": "<b>💰 Введи новое количество денег (число)</b>",
 }
 
 # ── Редкость карточек ────────────────────────────────────────────────────
@@ -248,8 +248,8 @@ async def get_chat_creator_id(bot: Bot, chat_id: int) -> int | None:
 
 def owner_notify_text(chat_title: str) -> str:
     return (
-        f"🎉 Ты подключил <b>Angry Копилку</b> к группе «{html.escape(chat_title)}»!\n\n"
-        "Теперь тебе будет начисляться 1% от всех монет, которые заработают игроки в этой группе."
+        f"<b>🎉 Ты подключил Angry Копилку к группе «{html.escape(chat_title)}»!\n\n"
+        "Теперь тебе будет начисляться 1% от всех монет, которые заработают игроки в этой группе.</b>"
     )
 
 
@@ -305,7 +305,7 @@ class EditCard(StatesGroup):
 # ── Клавиатуры ───────────────────────────────────────────────────────────
 
 def admin_menu_text() -> str:
-    return "⚙️ <b>Админ-панель</b>"
+    return "<b>⚙️ Админ-панель</b>"
 
 
 def admin_menu_kb():
@@ -316,7 +316,7 @@ def admin_menu_kb():
 
 
 def piggy_menu_text(cards_total: int) -> str:
-    return f"🐷 <b>Копилка</b>\n\nКарточек: {cards_total}"
+    return f"<b>🐷 Копилка\n\nКарточек: {cards_total}</b>"
 
 
 def piggy_menu_kb():
@@ -349,7 +349,7 @@ def edit_fields_kb(card_id: int):
     kb = InlineKeyboardBuilder()
     kb.button(text="📸 Фото", callback_data=f"piggy:editfield:{card_id}:photo_id")
     kb.button(text="✏️ Название", callback_data=f"piggy:editfield:{card_id}:name")
-    kb.button(text="⚡ Сила", callback_data=f"piggy:editfield:{card_id}:power")
+    kb.button(text="⚔️ Сила", callback_data=f"piggy:editfield:{card_id}:power")
     kb.button(text="💰 Деньги", callback_data=f"piggy:editfield:{card_id}:money")
     kb.button(text="⭐ Звёзды", callback_data=f"piggy:editfield:{card_id}:rarity")
     kb.button(text="⬅️ Назад", callback_data="piggy:edit")
@@ -367,11 +367,11 @@ def group_menu_kb():
 
 def card_caption(card: dict, prefix: str) -> str:
     return (
-        f"{prefix}\n\n"
-        f"🃏 <b>{html.escape(card['name'])}</b>\n"
+        f"<b>{prefix}\n\n"
+        f"🃏 {html.escape(card['name'])}</b>\n"
         f"{rarity_display(card['rarity'])}\n"
-        f"⚡ Сила: {card['power']}\n"
-        f"💰 Денег: {card['money']}"
+        f"<b>⚔️ Сила: {card['power']}\n"
+        f"💰 Денег: {card['money']}</b>"
     )
 
 
@@ -385,7 +385,7 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
                 "SELECT name, power, money, photo_id, rarity FROM cards ORDER BY random() LIMIT 1"
             )
             if card is None:
-                return None, "🕳 Копилка пока пуста — админ ещё не добавил карточки."
+                return None, "<b>🕳 Копилка пока пуста — админ ещё не добавил карточки.</b>"
 
             profile = await conn.fetchrow(
                 "SELECT last_open FROM chat_profiles WHERE chat_id = $1 AND user_id = $2 FOR UPDATE",
@@ -395,7 +395,7 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
             remaining = COOLDOWN_SECONDS - (now - last_open)
             if remaining > 0:
                 minutes, seconds = divmod(int(remaining), 60)
-                return None, f"⏳ Копилка ещё не наполнилась. Попробуй через {minutes} мин {seconds} сек."
+                return None, f"<b>⏳ Копилка ещё не наполнилась. Попробуй через {minutes} мин {seconds} сек.</b>"
 
             await conn.execute(
                 """
@@ -418,11 +418,11 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
             )
 
     caption = (
-        f"🎉 <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> крутит копилку!\n\n"
-        f"🃏 <b>{html.escape(card['name'])}</b>\n"
+        f"<b>🎉 <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> крутит копилку!\n\n"
+        f"🃏 {html.escape(card['name'])}</b>\n"
         f"{rarity_display(card['rarity'])}\n\n"
-        f"⚡ +{card['power']} силы\n"
-        f"💰 +{card['money']} монет"
+        f"<b>⚔️ +{card['power']} силы\n"
+        f"💰 +{card['money']} монет</b>"
     )
     return card["photo_id"], caption
 
@@ -433,17 +433,17 @@ async def perform_top(pool: asyncpg.Pool, chat_id: int) -> str:
         chat_id, TOP_LIMIT,
     )
     if not rows:
-        return "📭 Пока никто не крутил копилку в этом чате."
+        return "<b>📭 Пока никто не крутил копилку в этом чате.</b>"
 
     medals = ["🥇", "🥈", "🥉"]
-    lines = ["🏆 <b>Топ силы чата</b>", "━━━━━━━━━━━━━━", ""]
+    lines = ["<b>🏆 Топ силы чата", "━━━━━━━━━━━━━━", ""]
     for i, row in enumerate(rows):
         name = html.escape(row["name"])
         if i < len(medals):
-            lines.append(f"{medals[i]} <b>{name}</b>  ⚡ {row['power']}")
+            lines.append(f"{medals[i]} {name}  ⚔️ {row['power']}")
         else:
-            lines.append(f"{i + 1}.  {name}  ⚡ {row['power']}")
-    return "\n".join(lines)
+            lines.append(f"{i + 1}.  {name}  ⚔️ {row['power']}")
+    return "\n".join(lines) + "</b>"
 
 
 # ── Приватные сообщения (админ-панель) ───────────────────────────────────
@@ -487,11 +487,11 @@ async def piggy_list_cb(callback: CallbackQuery, pool: asyncpg.Pool):
     if not cards:
         await callback.answer("Карточек пока нет", show_alert=True)
         return
-    lines = ["📋 <b>Список карточек</b>", ""]
+    lines = ["<b>📋 Список карточек</b>", ""]
     for i, card in enumerate(cards, start=1):
         lines.append(
-            f"{i}. {html.escape(card['name'])} — {rarity_display(card['rarity'])}\n"
-            f"    ⚡{card['power']} · 💰{card['money']}"
+            f"<b>{i}. {html.escape(card['name'])}</b> — {rarity_display(card['rarity'])}\n"
+            f"<b>    ⚔️{card['power']} · 💰{card['money']}</b>"
         )
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ Назад", callback_data="piggy:menu")
@@ -504,29 +504,29 @@ async def piggy_list_cb(callback: CallbackQuery, pool: asyncpg.Pool):
 @router.callback_query(F.data == "piggy:add", IsAdminPrivate())
 async def piggy_add_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AddCard.photo)
-    await callback.message.edit_text("📸 Пришли фото карточки", reply_markup=cancel_kb())
+    await callback.message.edit_text("<b>📸 Пришли фото карточки</b>", reply_markup=cancel_kb())
     await callback.answer()
 
 
 @router.message(AddCard.photo, IsAdminPrivate())
 async def add_photo(message: Message, state: FSMContext):
     if not message.photo:
-        await message.answer("Пришли именно фото 🙂")
+        await message.answer("<b>Пришли именно фото 🙂</b>")
         return
     await state.update_data(photo_id=message.photo[-1].file_id)
     await state.set_state(AddCard.name)
-    await message.answer("✏️ Введи название карточки", reply_markup=cancel_kb())
+    await message.answer("<b>✏️ Введи название карточки</b>", reply_markup=cancel_kb())
 
 
 @router.message(AddCard.name, IsAdminPrivate())
 async def add_name(message: Message, state: FSMContext):
     name = (message.text or "").strip()
     if not name:
-        await message.answer("Название не может быть пустым, попробуй ещё раз.")
+        await message.answer("<b>Название не может быть пустым, попробуй ещё раз.</b>")
         return
     await state.update_data(name=name)
     await state.set_state(AddCard.power)
-    await message.answer("⚡ Введи силу карточки (число)", reply_markup=cancel_kb())
+    await message.answer("<b>⚔️ Введи силу карточки (число)</b>", reply_markup=cancel_kb())
 
 
 @router.message(AddCard.power, IsAdminPrivate())
@@ -534,11 +534,11 @@ async def add_power(message: Message, state: FSMContext):
     try:
         power = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Нужно целое число, попробуй ещё раз.")
+        await message.answer("<b>Нужно целое число, попробуй ещё раз.</b>")
         return
     await state.update_data(power=power)
     await state.set_state(AddCard.money)
-    await message.answer("💰 Введи количество денег (число)", reply_markup=cancel_kb())
+    await message.answer("<b>💰 Введи количество денег (число)</b>", reply_markup=cancel_kb())
 
 
 @router.message(AddCard.money, IsAdminPrivate())
@@ -546,13 +546,13 @@ async def add_money(message: Message, state: FSMContext, pool: asyncpg.Pool):
     try:
         money = int((message.text or "").strip())
     except ValueError:
-        await message.answer("Нужно целое число, попробуй ещё раз.")
+        await message.answer("<b>Нужно целое число, попробуй ещё раз.</b>")
         return
 
     await state.update_data(money=money)
     await state.set_state(AddCard.rarity)
     await message.answer(
-        "⭐ Выбери количество звёзд карточки:",
+        "<b>⭐ Выбери количество звёзд карточки:</b>",
         reply_markup=rarity_pick_kb("piggy:addrarity", "piggy:cancel"),
     )
 
@@ -581,7 +581,7 @@ async def piggy_edit_list(callback: CallbackQuery, pool: asyncpg.Pool):
         await callback.answer("Карточек пока нет", show_alert=True)
         return
     await callback.message.edit_text(
-        "✏️ Выбери карточку для изменения:", reply_markup=cards_pick_kb(cards, "edit")
+        "<b>✏️ Выбери карточку для изменения:</b>", reply_markup=cards_pick_kb(cards, "edit")
     )
     await callback.answer()
 
@@ -602,7 +602,7 @@ async def piggy_editfield_start(callback: CallbackQuery, state: FSMContext):
     _, _, card_id, field = callback.data.split(":")
     if field == "rarity":
         await callback.message.edit_text(
-            "⭐ Выбери количество звёзд:",
+            "<b>⭐ Выбери количество звёзд:</b>",
             reply_markup=rarity_pick_kb(f"piggy:setrarity:{card_id}", f"piggy:edit:{card_id}"),
         )
         await callback.answer()
@@ -636,19 +636,19 @@ async def piggy_editfield_value(message: Message, state: FSMContext, pool: async
 
     if field == "photo_id":
         if not message.photo:
-            await message.answer("Пришли именно фото 🙂")
+            await message.answer("<b>Пришли именно фото 🙂</b>")
             return
         value = message.photo[-1].file_id
     elif field in ("power", "money"):
         try:
             value = int((message.text or "").strip())
         except ValueError:
-            await message.answer("Нужно целое число, попробуй ещё раз.")
+            await message.answer("<b>Нужно целое число, попробуй ещё раз.</b>")
             return
     else:
         value = (message.text or "").strip()
         if not value:
-            await message.answer("Название не может быть пустым, попробуй ещё раз.")
+            await message.answer("<b>Название не может быть пустым, попробуй ещё раз.</b>")
             return
 
     await update_card_field(pool, card_id, field, value)
@@ -671,7 +671,7 @@ async def piggy_remove_list(callback: CallbackQuery, pool: asyncpg.Pool):
         await callback.answer("Карточек пока нет", show_alert=True)
         return
     await callback.message.edit_text(
-        "🗑 Выбери карточку для удаления:", reply_markup=cards_pick_kb(cards, "remove")
+        "<b>🗑 Выбери карточку для удаления:</b>", reply_markup=cards_pick_kb(cards, "remove")
     )
     await callback.answer()
 
@@ -685,7 +685,7 @@ async def piggy_remove_pick(callback: CallbackQuery, pool: asyncpg.Pool):
     cards = await list_cards(pool)
     if cards:
         await callback.message.edit_text(
-            "🗑 Выбери карточку для удаления:", reply_markup=cards_pick_kb(cards, "remove")
+            "<b>🗑 Выбери карточку для удаления:</b>", reply_markup=cards_pick_kb(cards, "remove")
         )
     else:
         await callback.message.edit_text(piggy_menu_text(0), reply_markup=piggy_menu_kb())
@@ -696,15 +696,15 @@ async def piggy_remove_pick(callback: CallbackQuery, pool: asyncpg.Pool):
 def profile_text(user, summary: dict, owner_rows: list[dict]) -> str:
     if summary["chats"] == 0 and not owner_rows:
         return (
-            "👤 <b>Профиль</b>\n\n"
+            "<b>👤 Профиль\n\n"
             "Ты пока не крутил копилку ни в одной группе.\n"
-            "Добавь бота в чат и используй там 🎰 /AngryOpen!"
+            "Добавь бота в чат и используй там 🎰 /AngryOpen!</b>"
         )
 
     lines = [
-        f"👤 <b>Профиль</b> — {html.escape(user.full_name)}",
+        f"👤 Профиль — {html.escape(user.full_name)}",
         "",
-        f"⚡ Сила (всего): {summary['power']}",
+        f"⚔️ Сила (всего): {summary['power']}",
         f"💰 Монет (всего): {summary['money']}",
         f"🎰 Круток копилки: {summary['opens']}",
         f"👥 Групп с игрой: {summary['chats']}",
@@ -716,7 +716,7 @@ def profile_text(user, summary: dict, owner_rows: list[dict]) -> str:
             f"💼 Реферальный доход (1% с групп): {total_earned:.2f} монет",
             f"   Подключено групп: {len(owner_rows)}",
         ]
-    return "\n".join(lines)
+    return "<b>" + "\n".join(lines) + "</b>"
 
 
 @router.message(F.chat.type == "private")
