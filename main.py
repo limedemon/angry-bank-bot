@@ -3,7 +3,6 @@ import html
 import io
 import logging
 import os
-import random
 import time
 
 import asyncpg
@@ -44,7 +43,7 @@ NON_ADMIN_PRIVATE_TEXT = (
     "Добавь меня в чат и используй там команды /AngryOpen и /AngryTop."
 )
 
-CARD_FIELDS = ("name", "power", "money", "photo_id")
+CARD_FIELDS = ("name", "power", "money", "photo_id", "rarity")
 FIELD_PROMPTS = {
     "photo_id": "📸 Пришли новое фото карточки",
     "name": "✏️ Введи новое название карточки",
@@ -57,19 +56,19 @@ FIELD_PROMPTS = {
 REGULAR_STAR_EMOJI_ID = "5224378646688474051"
 RAINBOW_STAR_EMOJI_ID = "5224307204202476701"
 
-# rarity code -> (кол-во звёзд, тип звезды, название редкости)
+# rarity code -> (кол-во звёзд, тип звезды)
 RARITY_INFO = {
-    1: (1, "regular", "Обычная"),
-    2: (2, "regular", "Редкая"),
-    3: (3, "regular", "Эпическая"),
-    4: (3, "rainbow", "Легендарная"),
+    1: (1, "regular"),
+    2: (2, "regular"),
+    3: (3, "regular"),
+    4: (3, "rainbow"),
 }
-RARITY_WEIGHTS = [(1, 50), (2, 35), (3, 13), (4, 2)]
-
-
-def roll_rarity() -> int:
-    codes, weights = zip(*RARITY_WEIGHTS)
-    return random.choices(codes, weights=weights, k=1)[0]
+RARITY_PICK_BUTTONS = (
+    (1, "⭐"),
+    (2, "⭐⭐"),
+    (3, "⭐⭐⭐"),
+    (4, "🌈⭐⭐⭐"),
+)
 
 
 def stars_html(count: int, kind: str) -> str:
@@ -79,8 +78,17 @@ def stars_html(count: int, kind: str) -> str:
 
 
 def rarity_display(rarity: int) -> str:
-    count, kind, label = RARITY_INFO[rarity]
-    return f"{stars_html(count, kind)} {label}"
+    count, kind = RARITY_INFO[rarity]
+    return stars_html(count, kind)
+
+
+def rarity_pick_kb(callback_prefix: str, back_callback: str):
+    kb = InlineKeyboardBuilder()
+    for code, label in RARITY_PICK_BUTTONS:
+        kb.button(text=label, callback_data=f"{callback_prefix}:{code}")
+    kb.button(text="⬅️ Назад", callback_data=back_callback)
+    kb.adjust(4, 1)
+    return kb.as_markup()
 
 
 # ── Улучшение фото ───────────────────────────────────────────────────────
@@ -314,6 +322,7 @@ class AddCard(StatesGroup):
     name = State()
     power = State()
     money = State()
+    rarity = State()
 
 
 class EditCard(StatesGroup):
@@ -369,8 +378,9 @@ def edit_fields_kb(card_id: int):
     kb.button(text="✏️ Название", callback_data=f"piggy:editfield:{card_id}:name")
     kb.button(text="⚡ Сила", callback_data=f"piggy:editfield:{card_id}:power")
     kb.button(text="💰 Деньги", callback_data=f"piggy:editfield:{card_id}:money")
+    kb.button(text="⭐ Звёзды", callback_data=f"piggy:editfield:{card_id}:rarity")
     kb.button(text="⬅️ Назад", callback_data="piggy:edit")
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 1, 1)
     return kb.as_markup()
 
 
@@ -568,15 +578,27 @@ async def add_money(message: Message, state: FSMContext, pool: asyncpg.Pool):
         await message.answer("Нужно целое число, попробуй ещё раз.")
         return
 
+    await state.update_data(money=money)
+    await state.set_state(AddCard.rarity)
+    await message.answer(
+        "⭐ Выбери количество звёзд карточки:",
+        reply_markup=rarity_pick_kb("piggy:addrarity", "piggy:cancel"),
+    )
+
+
+@router.callback_query(AddCard.rarity, F.data.startswith("piggy:addrarity:"), IsAdminPrivate())
+async def add_rarity_pick(callback: CallbackQuery, state: FSMContext, pool: asyncpg.Pool):
+    rarity = int(callback.data.split(":")[2])
     data = await state.get_data()
-    rarity = roll_rarity()
-    await add_card(pool, data["name"], data["power"], money, data["photo_id"], rarity)
+    await add_card(pool, data["name"], data["power"], data["money"], data["photo_id"], rarity)
     await state.clear()
 
-    card = {"name": data["name"], "power": data["power"], "money": money, "rarity": rarity}
-    await message.answer_photo(data["photo_id"], caption=card_caption(card, "✅ Карточка добавлена!"))
+    card = {"name": data["name"], "power": data["power"], "money": data["money"], "rarity": rarity}
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer_photo(data["photo_id"], caption=card_caption(card, "✅ Карточка добавлена!"))
     total = await cards_count(pool)
-    await message.answer(piggy_menu_text(total), reply_markup=piggy_menu_kb())
+    await callback.message.answer(piggy_menu_text(total), reply_markup=piggy_menu_kb())
+    await callback.answer()
 
 
 # — Изменение —
@@ -607,9 +629,31 @@ async def piggy_edit_pick(callback: CallbackQuery, pool: asyncpg.Pool):
 @router.callback_query(F.data.startswith("piggy:editfield:"), IsAdminPrivate())
 async def piggy_editfield_start(callback: CallbackQuery, state: FSMContext):
     _, _, card_id, field = callback.data.split(":")
+    if field == "rarity":
+        await callback.message.edit_text(
+            "⭐ Выбери количество звёзд:",
+            reply_markup=rarity_pick_kb(f"piggy:setrarity:{card_id}", f"piggy:edit:{card_id}"),
+        )
+        await callback.answer()
+        return
     await state.set_state(EditCard.waiting_value)
     await state.update_data(card_id=int(card_id), field=field)
     await callback.message.edit_text(FIELD_PROMPTS[field], reply_markup=cancel_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("piggy:setrarity:"), IsAdminPrivate())
+async def piggy_set_rarity(callback: CallbackQuery, pool: asyncpg.Pool):
+    _, _, card_id, rarity = callback.data.split(":")
+    await update_card_field(pool, int(card_id), "rarity", int(rarity))
+
+    card = await get_card(pool, int(card_id))
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer_photo(
+        card["photo_id"],
+        caption=card_caption(card, "✅ Карточка обновлена!"),
+        reply_markup=edit_fields_kb(int(card_id)),
+    )
     await callback.answer()
 
 
