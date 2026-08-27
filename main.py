@@ -381,8 +381,11 @@ async def set_bot_commands(bot: Bot) -> None:
     )
 
 
+BOT_TOKEN = "8822713742:AAH_AWB1yhYl1UY1GvwctUg5sz2RltzyeW0"
+
+
 async def main() -> None:
-    token = os.environ.get("BOT_TOKEN")
+    token = os.environ.get("BOT_TOKEN") or BOT_TOKEN
     if not token:
         raise RuntimeError("Не найден токен бота в переменной окружения BOT_TOKEN")
 
