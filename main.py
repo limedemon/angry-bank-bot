@@ -429,17 +429,20 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
 
 async def perform_top(pool: asyncpg.Pool, chat_id: int) -> str:
     rows = await pool.fetch(
-        "SELECT name, power, money FROM chat_profiles WHERE chat_id = $1 ORDER BY power DESC LIMIT $2",
+        "SELECT name, power FROM chat_profiles WHERE chat_id = $1 ORDER BY power DESC LIMIT $2",
         chat_id, TOP_LIMIT,
     )
     if not rows:
         return "📭 Пока никто не крутил копилку в этом чате."
 
     medals = ["🥇", "🥈", "🥉"]
-    lines = ["🏆 <b>Топ силы чата</b>", ""]
+    lines = ["🏆 <b>Топ силы чата</b>", "━━━━━━━━━━━━━━", ""]
     for i, row in enumerate(rows):
-        prefix = medals[i] if i < len(medals) else f"{i + 1}."
-        lines.append(f"{prefix} {html.escape(row['name'])} — ⚡ {row['power']} · 💰 {row['money']}")
+        name = html.escape(row["name"])
+        if i < len(medals):
+            lines.append(f"{medals[i]} <b>{name}</b>  ⚡ {row['power']}")
+        else:
+            lines.append(f"{i + 1}.  {name}  ⚡ {row['power']}")
     return "\n".join(lines)
 
 
