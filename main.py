@@ -1,12 +1,15 @@
 import asyncio
+import html
 import logging
 import os
+import random
 import time
 
 import asyncpg
 from aiogram import Bot, BaseMiddleware, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -16,6 +19,7 @@ from aiogram.types import (
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
     CallbackQuery,
+    ChatMemberUpdated,
     Message,
     TelegramObject,
 )
@@ -45,6 +49,36 @@ FIELD_PROMPTS = {
     "money": "💰 Введи новое количество денег (число)",
 }
 
+# ── Редкость карточек ────────────────────────────────────────────────────
+
+REGULAR_STAR_EMOJI_ID = "5224378646688474051"
+RAINBOW_STAR_EMOJI_ID = "5224307204202476701"
+
+# rarity code -> (кол-во звёзд, тип звезды, название редкости)
+RARITY_INFO = {
+    1: (1, "regular", "Обычная"),
+    2: (2, "regular", "Редкая"),
+    3: (3, "regular", "Эпическая"),
+    4: (3, "rainbow", "Легендарная"),
+}
+RARITY_WEIGHTS = [(1, 50), (2, 35), (3, 13), (4, 2)]
+
+
+def roll_rarity() -> int:
+    codes, weights = zip(*RARITY_WEIGHTS)
+    return random.choices(codes, weights=weights, k=1)[0]
+
+
+def stars_html(count: int, kind: str) -> str:
+    emoji_id = RAINBOW_STAR_EMOJI_ID if kind == "rainbow" else REGULAR_STAR_EMOJI_ID
+    star = f'<tg-emoji emoji-id="{emoji_id}">⭐️</tg-emoji>'
+    return star * count
+
+
+def rarity_display(rarity: int) -> str:
+    count, kind, label = RARITY_INFO[rarity]
+    return f"{stars_html(count, kind)} {label}"
+
 router = Router()
 
 
@@ -64,9 +98,11 @@ SCHEMA_STATEMENTS = (
         name TEXT NOT NULL,
         power BIGINT NOT NULL,
         money BIGINT NOT NULL,
-        photo_id TEXT NOT NULL
+        photo_id TEXT NOT NULL,
+        rarity SMALLINT NOT NULL DEFAULT 1
     )
     """,
+    "ALTER TABLE cards ADD COLUMN IF NOT EXISTS rarity SMALLINT NOT NULL DEFAULT 1",
     """
     CREATE TABLE IF NOT EXISTS chat_profiles (
         chat_id BIGINT NOT NULL,
@@ -77,6 +113,15 @@ SCHEMA_STATEMENTS = (
         opens INTEGER NOT NULL DEFAULT 0,
         last_open DOUBLE PRECISION NOT NULL DEFAULT 0,
         PRIMARY KEY (chat_id, user_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS chat_owners (
+        chat_id BIGINT PRIMARY KEY,
+        owner_id BIGINT NOT NULL,
+        chat_title TEXT NOT NULL,
+        notified BOOLEAN NOT NULL DEFAULT FALSE,
+        earned NUMERIC(20, 4) NOT NULL DEFAULT 0
     )
     """,
 )
@@ -99,7 +144,7 @@ async def ensure_admin(pool: asyncpg.Pool, user_id: int) -> None:
 
 
 async def list_cards(pool: asyncpg.Pool) -> list[dict]:
-    rows = await pool.fetch("SELECT id, name, power, money, photo_id FROM cards ORDER BY id")
+    rows = await pool.fetch("SELECT id, name, power, money, photo_id, rarity FROM cards ORDER BY id")
     return [dict(row) for row in rows]
 
 
@@ -109,15 +154,15 @@ async def cards_count(pool: asyncpg.Pool) -> int:
 
 async def get_card(pool: asyncpg.Pool, card_id: int) -> dict | None:
     row = await pool.fetchrow(
-        "SELECT id, name, power, money, photo_id FROM cards WHERE id = $1", card_id
+        "SELECT id, name, power, money, photo_id, rarity FROM cards WHERE id = $1", card_id
     )
     return dict(row) if row else None
 
 
-async def add_card(pool: asyncpg.Pool, name: str, power: int, money: int, photo_id: str) -> None:
+async def add_card(pool: asyncpg.Pool, name: str, power: int, money: int, photo_id: str, rarity: int) -> None:
     await pool.execute(
-        "INSERT INTO cards (name, power, money, photo_id) VALUES ($1, $2, $3, $4)",
-        name, power, money, photo_id,
+        "INSERT INTO cards (name, power, money, photo_id, rarity) VALUES ($1, $2, $3, $4, $5)",
+        name, power, money, photo_id, rarity,
     )
 
 
@@ -131,6 +176,74 @@ async def delete_card(pool: asyncpg.Pool, card_id: int) -> str | None:
     return await pool.fetchval("DELETE FROM cards WHERE id = $1 RETURNING name", card_id)
 
 
+async def register_chat_owner(pool: asyncpg.Pool, chat_id: int, owner_id: int, chat_title: str) -> bool:
+    """Возвращает True, если запись создана впервые (группа ещё не была зарегистрирована)."""
+    inserted = await pool.fetchval(
+        """
+        INSERT INTO chat_owners (chat_id, owner_id, chat_title)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (chat_id) DO NOTHING
+        RETURNING chat_id
+        """,
+        chat_id, owner_id, chat_title,
+    )
+    return inserted is not None
+
+
+async def mark_owner_notified(pool: asyncpg.Pool, chat_id: int) -> None:
+    await pool.execute("UPDATE chat_owners SET notified = TRUE WHERE chat_id = $1", chat_id)
+
+
+async def get_pending_owner_chats(pool: asyncpg.Pool, owner_id: int) -> list[dict]:
+    rows = await pool.fetch(
+        "SELECT chat_id, chat_title FROM chat_owners WHERE owner_id = $1 AND notified = FALSE",
+        owner_id,
+    )
+    return [dict(row) for row in rows]
+
+
+async def get_owner_earnings(pool: asyncpg.Pool, owner_id: int) -> list[dict]:
+    rows = await pool.fetch(
+        "SELECT chat_title, earned FROM chat_owners WHERE owner_id = $1 ORDER BY earned DESC",
+        owner_id,
+    )
+    return [dict(row) for row in rows]
+
+
+async def get_player_summary(pool: asyncpg.Pool, user_id: int) -> dict:
+    row = await pool.fetchrow(
+        """
+        SELECT
+            COALESCE(SUM(power), 0) AS power,
+            COALESCE(SUM(money), 0) AS money,
+            COALESCE(SUM(opens), 0) AS opens,
+            COUNT(*) AS chats
+        FROM chat_profiles
+        WHERE user_id = $1
+        """,
+        user_id,
+    )
+    return dict(row)
+
+
+async def get_chat_creator_id(bot: Bot, chat_id: int) -> int | None:
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+    except TelegramAPIError:
+        return None
+    for member in admins:
+        if member.status == "creator":
+            return member.user.id
+    return None
+
+
+def owner_notify_text(chat_title: str) -> str:
+    return (
+        f"🎉 Ты подключил <b>Angry Копилку</b> к группе «{html.escape(chat_title)}»!\n\n"
+        "Теперь тебе будет начисляться 1% от всех монет, которые заработают игроки в этой группе."
+    )
+
+
 # ── Админ ────────────────────────────────────────────────────────────────
 
 class AdminAssignMiddleware(BaseMiddleware):
@@ -138,6 +251,22 @@ class AdminAssignMiddleware(BaseMiddleware):
         pool = data.get("pool")
         if pool is not None and event.from_user is not None:
             await ensure_admin(pool, event.from_user.id)
+        return await handler(event, data)
+
+
+class OwnerNotifyMiddleware(BaseMiddleware):
+    """Досылает создателю группы отложенное уведомление о 1%, когда он сам пишет боту в ЛС."""
+
+    async def __call__(self, handler, event: Message, data):
+        pool = data.get("pool")
+        bot = data.get("bot")
+        if pool is not None and bot is not None and event.chat.type == "private" and event.from_user is not None:
+            for chat in await get_pending_owner_chats(pool, event.from_user.id):
+                try:
+                    await bot.send_message(event.from_user.id, owner_notify_text(chat["chat_title"]))
+                except TelegramForbiddenError:
+                    continue
+                await mark_owner_notified(pool, chat["chat_id"])
         return await handler(event, data)
 
 
@@ -228,7 +357,8 @@ def group_menu_kb():
 def card_caption(card: dict, prefix: str) -> str:
     return (
         f"{prefix}\n\n"
-        f"🃏 <b>{card['name']}</b>\n"
+        f"🃏 <b>{html.escape(card['name'])}</b>\n"
+        f"{rarity_display(card['rarity'])}\n"
         f"⚡ Сила: {card['power']}\n"
         f"💰 Денег: {card['money']}"
     )
@@ -241,7 +371,7 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
     async with pool.acquire() as conn:
         async with conn.transaction():
             card = await conn.fetchrow(
-                "SELECT name, power, money, photo_id FROM cards ORDER BY random() LIMIT 1"
+                "SELECT name, power, money, photo_id, rarity FROM cards ORDER BY random() LIMIT 1"
             )
             if card is None:
                 return None, "🕳 Копилка пока пуста — админ ещё не добавил карточки."
@@ -270,9 +400,16 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
                 chat_id, user.id, user.full_name, card["power"], card["money"], now,
             )
 
+            # Реферальные 1% владельцу группы — начисляются молча, без уведомлений.
+            await conn.execute(
+                "UPDATE chat_owners SET earned = earned + ($1::numeric / 100) WHERE chat_id = $2",
+                card["money"], chat_id,
+            )
+
     caption = (
-        f"🎉 <a href='tg://user?id={user.id}'>{user.full_name}</a> крутит копилку!\n\n"
-        f"🃏 <b>{card['name']}</b>\n"
+        f"🎉 <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> крутит копилку!\n\n"
+        f"🃏 <b>{html.escape(card['name'])}</b>\n"
+        f"{rarity_display(card['rarity'])}\n\n"
         f"⚡ +{card['power']} силы\n"
         f"💰 +{card['money']} монет"
     )
@@ -291,7 +428,7 @@ async def perform_top(pool: asyncpg.Pool, chat_id: int) -> str:
     lines = ["🏆 <b>Топ силы чата</b>", ""]
     for i, row in enumerate(rows):
         prefix = medals[i] if i < len(medals) else f"{i + 1}."
-        lines.append(f"{prefix} {row['name']} — ⚡ {row['power']} · 💰 {row['money']}")
+        lines.append(f"{prefix} {html.escape(row['name'])} — ⚡ {row['power']} · 💰 {row['money']}")
     return "\n".join(lines)
 
 
@@ -338,7 +475,10 @@ async def piggy_list_cb(callback: CallbackQuery, pool: asyncpg.Pool):
         return
     lines = ["📋 <b>Список карточек</b>", ""]
     for i, card in enumerate(cards, start=1):
-        lines.append(f"{i}. {card['name']} — ⚡{card['power']} · 💰{card['money']}")
+        lines.append(
+            f"{i}. {html.escape(card['name'])} — {rarity_display(card['rarity'])}\n"
+            f"    ⚡{card['power']} · 💰{card['money']}"
+        )
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ Назад", callback_data="piggy:menu")
     await callback.message.edit_text("\n".join(lines), reply_markup=kb.as_markup())
@@ -396,10 +536,11 @@ async def add_money(message: Message, state: FSMContext, pool: asyncpg.Pool):
         return
 
     data = await state.get_data()
-    await add_card(pool, data["name"], data["power"], money, data["photo_id"])
+    rarity = roll_rarity()
+    await add_card(pool, data["name"], data["power"], money, data["photo_id"], rarity)
     await state.clear()
 
-    card = {"name": data["name"], "power": data["power"], "money": money}
+    card = {"name": data["name"], "power": data["power"], "money": money, "rarity": rarity}
     await message.answer_photo(data["photo_id"], caption=card_caption(card, "✅ Карточка добавлена!"))
     total = await cards_count(pool)
     await message.answer(piggy_menu_text(total), reply_markup=piggy_menu_kb())
@@ -502,6 +643,41 @@ async def piggy_remove_pick(callback: CallbackQuery, pool: asyncpg.Pool):
         await callback.message.edit_text(piggy_menu_text(0), reply_markup=piggy_menu_kb())
 
 
+# — Профиль игрока —
+
+def profile_text(user, summary: dict, owner_rows: list[dict]) -> str:
+    if summary["chats"] == 0 and not owner_rows:
+        return (
+            "👤 <b>Профиль</b>\n\n"
+            "Ты пока не крутил копилку ни в одной группе.\n"
+            "Добавь бота в чат и используй там 🎰 /AngryOpen!"
+        )
+
+    lines = [
+        f"👤 <b>Профиль</b> — {html.escape(user.full_name)}",
+        "",
+        f"⚡ Сила (всего): {summary['power']}",
+        f"💰 Монет (всего): {summary['money']}",
+        f"🎰 Круток копилки: {summary['opens']}",
+        f"👥 Групп с игрой: {summary['chats']}",
+    ]
+    if owner_rows:
+        total_earned = sum(row["earned"] for row in owner_rows)
+        lines += [
+            "",
+            f"💼 Реферальный доход (1% с групп): {total_earned:.2f} монет",
+            f"   Подключено групп: {len(owner_rows)}",
+        ]
+    return "\n".join(lines)
+
+
+@router.message(F.chat.type == "private")
+async def show_profile(message: Message, pool: asyncpg.Pool):
+    summary = await get_player_summary(pool, message.from_user.id)
+    owner_rows = await get_owner_earnings(pool, message.from_user.id)
+    await message.answer(profile_text(message.from_user, summary, owner_rows))
+
+
 # ── Групповые команды ─────────────────────────────────────────────────────
 
 GROUP_CHATS = F.chat.type.in_({"group", "supergroup"})
@@ -542,6 +718,31 @@ async def cb_group_top(callback: CallbackQuery, pool: asyncpg.Pool):
     await callback.answer()
 
 
+# ── Реферальная программа (1% создателю группы) ───────────────────────────
+
+@router.my_chat_member(GROUP_CHATS)
+async def on_bot_added(event: ChatMemberUpdated, bot: Bot, pool: asyncpg.Pool):
+    old_status = event.old_chat_member.status
+    new_status = event.new_chat_member.status
+    if old_status not in ("left", "kicked") or new_status not in ("member", "administrator"):
+        return
+
+    owner_id = await get_chat_creator_id(bot, event.chat.id)
+    if owner_id is None:
+        return
+
+    title = event.chat.title or "группа"
+    is_new = await register_chat_owner(pool, event.chat.id, owner_id, title)
+    if not is_new:
+        return
+
+    try:
+        await bot.send_message(owner_id, owner_notify_text(title))
+    except TelegramForbiddenError:
+        return
+    await mark_owner_notified(pool, event.chat.id)
+
+
 # ── Запуск ───────────────────────────────────────────────────────────────
 
 async def set_bot_commands(bot: Bot) -> None:
@@ -577,6 +778,7 @@ async def main() -> None:
         bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         dp = Dispatcher(storage=MemoryStorage())
         dp.message.outer_middleware(AdminAssignMiddleware())
+        dp.message.outer_middleware(OwnerNotifyMiddleware())
         dp.include_router(router)
 
         await set_bot_commands(bot)
