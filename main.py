@@ -1,6 +1,5 @@
 import asyncio
 import html
-import io
 import logging
 import os
 import time
@@ -18,14 +17,12 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
-    BufferedInputFile,
     CallbackQuery,
     ChatMemberUpdated,
     Message,
     TelegramObject,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 logging.basicConfig(level=logging.INFO)
 
@@ -89,30 +86,6 @@ def rarity_pick_kb(callback_prefix: str, back_callback: str):
     kb.button(text="⬅️ Назад", callback_data=back_callback)
     kb.adjust(4, 1)
     return kb.as_markup()
-
-
-# ── Улучшение фото ───────────────────────────────────────────────────────
-
-def enhance_photo(raw: bytes) -> bytes:
-    img = Image.open(io.BytesIO(raw)).convert("RGB")
-
-    smoothed = img.filter(ImageFilter.SMOOTH)
-    img = Image.blend(img, smoothed, 0.25)  # лёгкое подавление JPEG-шума
-
-    img = ImageOps.autocontrast(img, cutoff=1)
-    img = ImageEnhance.Color(img).enhance(1.15)
-    img = ImageEnhance.Contrast(img).enhance(1.05)
-    img = ImageEnhance.Sharpness(img).enhance(1.6)
-
-    buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=92)
-    return buffer.getvalue()
-
-
-async def download_and_enhance(bot: Bot, file_id: str) -> bytes:
-    buffer = io.BytesIO()
-    await bot.download(file_id, destination=buffer)
-    return enhance_photo(buffer.getvalue())
 
 
 router = Router()
@@ -533,16 +506,11 @@ async def piggy_add_start(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(AddCard.photo, IsAdminPrivate())
-async def add_photo(message: Message, state: FSMContext, bot: Bot):
+async def add_photo(message: Message, state: FSMContext):
     if not message.photo:
         await message.answer("Пришли именно фото 🙂")
         return
-
-    enhanced = await download_and_enhance(bot, message.photo[-1].file_id)
-    sent = await message.answer_photo(
-        BufferedInputFile(enhanced, filename="card.jpg"), caption="✨ Фото улучшено"
-    )
-    await state.update_data(photo_id=sent.photo[-1].file_id)
+    await state.update_data(photo_id=message.photo[-1].file_id)
     await state.set_state(AddCard.name)
     await message.answer("✏️ Введи название карточки", reply_markup=cancel_kb())
 
@@ -658,7 +626,7 @@ async def piggy_set_rarity(callback: CallbackQuery, pool: asyncpg.Pool):
 
 
 @router.message(EditCard.waiting_value, IsAdminPrivate())
-async def piggy_editfield_value(message: Message, state: FSMContext, pool: asyncpg.Pool, bot: Bot):
+async def piggy_editfield_value(message: Message, state: FSMContext, pool: asyncpg.Pool):
     data = await state.get_data()
     field = data["field"]
     card_id = data["card_id"]
@@ -667,11 +635,7 @@ async def piggy_editfield_value(message: Message, state: FSMContext, pool: async
         if not message.photo:
             await message.answer("Пришли именно фото 🙂")
             return
-        enhanced = await download_and_enhance(bot, message.photo[-1].file_id)
-        sent = await message.answer_photo(
-            BufferedInputFile(enhanced, filename="card.jpg"), caption="✨ Фото улучшено"
-        )
-        value = sent.photo[-1].file_id
+        value = message.photo[-1].file_id
     elif field in ("power", "money"):
         try:
             value = int((message.text or "").strip())
