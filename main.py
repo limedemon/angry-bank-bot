@@ -27,17 +27,21 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 logging.basicConfig(level=logging.INFO)
 
 COOLDOWN_SECONDS = 60 * 60
+CLASS_COOLDOWN_SECONDS = 5 * 60
+CLASS_SPIN_COST = 10
 TOP_LIMIT = 10
 
 GROUP_INTRO_TEXT = (
     "<b>🐦 Angry Копилка\n\n"
-    "Раз в час можно крутануть копилку и получить силу и монеты.\n\n"
+    "Раз в час можно крутануть копилку и получить силу и монеты.\n"
+    f"За {CLASS_SPIN_COST} монет (раз в 5 минут) можно крутить класс и получить только силу.\n\n"
     "🎰 /AngryOpen — крутануть копилку\n"
+    "🎓 /AngryClass — крутануть класс\n"
     "🏆 /AngryTop — топ силы чата</b>"
 )
 NON_ADMIN_PRIVATE_TEXT = (
     "<b>🐦 Привет! Я работаю в группах.\n\n"
-    "Добавь меня в чат и используй там команды /AngryOpen и /AngryTop.</b>"
+    "Добавь меня в чат и используй там команды /AngryOpen, /AngryClass и /AngryTop.</b>"
 )
 
 CARD_FIELDS = ("name", "power", "money", "photo_id", "rarity", "bird")
@@ -46,6 +50,13 @@ FIELD_PROMPTS = {
     "name": "<b>✏️ Введи новое название карточки</b>",
     "power": "<b>⚔️ Введи новую силу карточки (число)</b>",
     "money": "<b>💰 Введи новое количество денег (число)</b>",
+}
+
+CLASS_CARD_FIELDS = ("name", "power", "photo_id", "rarity", "bird")
+CLASS_FIELD_PROMPTS = {
+    "photo_id": "<b>📸 Пришли новое фото карточки</b>",
+    "name": "<b>✏️ Введи новое название карточки</b>",
+    "power": "<b>⚔️ Введи новую силу карточки (число)</b>",
 }
 
 # ── Редкость карточек ────────────────────────────────────────────────────
@@ -146,6 +157,16 @@ SCHEMA_STATEMENTS = (
     "ALTER TABLE cards ADD COLUMN IF NOT EXISTS rarity SMALLINT NOT NULL DEFAULT 1",
     "ALTER TABLE cards ADD COLUMN IF NOT EXISTS bird SMALLINT NOT NULL DEFAULT 3",
     """
+    CREATE TABLE IF NOT EXISTS class_cards (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        power BIGINT NOT NULL,
+        photo_id TEXT NOT NULL,
+        rarity SMALLINT NOT NULL DEFAULT 1,
+        bird SMALLINT NOT NULL DEFAULT 3
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS chat_profiles (
         chat_id BIGINT NOT NULL,
         user_id BIGINT NOT NULL,
@@ -154,9 +175,11 @@ SCHEMA_STATEMENTS = (
         money BIGINT NOT NULL DEFAULT 0,
         opens INTEGER NOT NULL DEFAULT 0,
         last_open DOUBLE PRECISION NOT NULL DEFAULT 0,
+        last_class DOUBLE PRECISION NOT NULL DEFAULT 0,
         PRIMARY KEY (chat_id, user_id)
     )
     """,
+    "ALTER TABLE chat_profiles ADD COLUMN IF NOT EXISTS last_class DOUBLE PRECISION NOT NULL DEFAULT 0",
     """
     CREATE TABLE IF NOT EXISTS chat_owners (
         chat_id BIGINT PRIMARY KEY,
@@ -220,6 +243,41 @@ async def update_card_field(pool: asyncpg.Pool, card_id: int, field: str, value)
 
 async def delete_card(pool: asyncpg.Pool, card_id: int) -> str | None:
     return await pool.fetchval("DELETE FROM cards WHERE id = $1 RETURNING name", card_id)
+
+
+async def list_class_cards(pool: asyncpg.Pool) -> list[dict]:
+    rows = await pool.fetch("SELECT id, name, power, photo_id, rarity, bird FROM class_cards ORDER BY id")
+    return [dict(row) for row in rows]
+
+
+async def class_cards_count(pool: asyncpg.Pool) -> int:
+    return await pool.fetchval("SELECT COUNT(*) FROM class_cards")
+
+
+async def get_class_card(pool: asyncpg.Pool, card_id: int) -> dict | None:
+    row = await pool.fetchrow(
+        "SELECT id, name, power, photo_id, rarity, bird FROM class_cards WHERE id = $1", card_id
+    )
+    return dict(row) if row else None
+
+
+async def add_class_card(
+    pool: asyncpg.Pool, name: str, power: int, photo_id: str, rarity: int, bird: int
+) -> None:
+    await pool.execute(
+        "INSERT INTO class_cards (name, power, photo_id, rarity, bird) VALUES ($1, $2, $3, $4, $5)",
+        name, power, photo_id, rarity, bird,
+    )
+
+
+async def update_class_card_field(pool: asyncpg.Pool, card_id: int, field: str, value) -> None:
+    if field not in CLASS_CARD_FIELDS:
+        raise ValueError(f"Недопустимое поле карточки: {field}")
+    await pool.execute(f"UPDATE class_cards SET {field} = $1 WHERE id = $2", value, card_id)
+
+
+async def delete_class_card(pool: asyncpg.Pool, card_id: int) -> str | None:
+    return await pool.fetchval("DELETE FROM class_cards WHERE id = $1 RETURNING name", card_id)
 
 
 async def register_chat_owner(
@@ -334,6 +392,18 @@ class EditCard(StatesGroup):
     waiting_value = State()
 
 
+class AddClassCard(StatesGroup):
+    photo = State()
+    name = State()
+    power = State()
+    rarity = State()
+    bird = State()
+
+
+class EditClassCard(StatesGroup):
+    waiting_value = State()
+
+
 # ── Клавиатуры ───────────────────────────────────────────────────────────
 
 def admin_menu_text() -> str:
@@ -343,6 +413,7 @@ def admin_menu_text() -> str:
 def admin_menu_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="🐷 Копилка", callback_data="piggy:menu")
+    kb.button(text="🎓 Класс", callback_data="class:menu")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -362,17 +433,17 @@ def piggy_menu_kb():
     return kb.as_markup()
 
 
-def cancel_kb():
+def cancel_kb(callback_data: str = "piggy:cancel"):
     kb = InlineKeyboardBuilder()
-    kb.button(text="✖️ Отмена", callback_data="piggy:cancel")
+    kb.button(text="✖️ Отмена", callback_data=callback_data)
     return kb.as_markup()
 
 
-def cards_pick_kb(cards: list, action: str):
+def cards_pick_kb(cards: list, action: str, namespace: str = "piggy"):
     kb = InlineKeyboardBuilder()
     for card in cards:
-        kb.button(text=card["name"], callback_data=f"piggy:{action}:{card['id']}")
-    kb.button(text="⬅️ Назад", callback_data="piggy:menu")
+        kb.button(text=card["name"], callback_data=f"{namespace}:{action}:{card['id']}")
+    kb.button(text="⬅️ Назад", callback_data=f"{namespace}:menu")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -390,9 +461,37 @@ def edit_fields_kb(card_id: int):
     return kb.as_markup()
 
 
+def class_menu_text(cards_total: int) -> str:
+    return f"<b>🎓 Класс\n\nКарточек: {cards_total}</b>"
+
+
+def class_menu_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📋 Список карточек", callback_data="class:list")
+    kb.button(text="➕ Добавить карточку", callback_data="class:add")
+    kb.button(text="✏️ Изменить карточку", callback_data="class:edit")
+    kb.button(text="🗑 Удалить карточку", callback_data="class:remove")
+    kb.button(text="⬅️ Назад", callback_data="admin:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def class_edit_fields_kb(card_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📸 Фото", callback_data=f"class:editfield:{card_id}:photo_id")
+    kb.button(text="✏️ Название", callback_data=f"class:editfield:{card_id}:name")
+    kb.button(text="⚔️ Сила", callback_data=f"class:editfield:{card_id}:power")
+    kb.button(text="⭐ Звёзды", callback_data=f"class:editfield:{card_id}:rarity")
+    kb.button(text="🐦 Птица", callback_data=f"class:editfield:{card_id}:bird")
+    kb.button(text="⬅️ Назад", callback_data="class:edit")
+    kb.adjust(2, 2, 1, 1)
+    return kb.as_markup()
+
+
 def group_menu_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="🎰 Открыть копилку", callback_data="group:open")
+    kb.button(text="🎓 Крутить класс", callback_data="group:class")
     kb.button(text="🏆 Топ силы", callback_data="group:top")
     kb.adjust(1)
     return kb.as_markup()
@@ -405,6 +504,15 @@ def card_caption(card: dict, prefix: str) -> str:
         f"{rarity_display(card['rarity'])}\n"
         f"<b>⚔️ Сила: {card['power']}\n"
         f"💰 Денег: {card['money']}</b>"
+    )
+
+
+def class_card_caption(card: dict, prefix: str) -> str:
+    return (
+        f"<b>{prefix}\n\n"
+        f"🃏 {card_title(card)}</b>\n"
+        f"{rarity_display(card['rarity'])}\n"
+        f"<b>⚔️ Сила: {card['power']}</b>"
     )
 
 
@@ -466,6 +574,54 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
         f"{rarity_display(card['rarity'])}\n\n"
         f"<b>⚔️ +{card['power']} силы\n"
         f"💰 +{card['money']} монет</b>"
+    )
+    return card["photo_id"], caption
+
+
+async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | None, str]:
+    now = time.time()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            card = await conn.fetchrow(
+                "SELECT name, power, photo_id, rarity, bird FROM class_cards ORDER BY random() LIMIT 1"
+            )
+            if card is None:
+                return None, "<b>🕳 Класс пока пуст — админ ещё не добавил карточки.</b>"
+
+            profile = await conn.fetchrow(
+                "SELECT money, last_class FROM chat_profiles WHERE chat_id = $1 AND user_id = $2 FOR UPDATE",
+                chat_id, user.id,
+            )
+            balance = profile["money"] if profile else 0
+            last_class = profile["last_class"] if profile else 0
+
+            remaining = CLASS_COOLDOWN_SECONDS - (now - last_class)
+            if remaining > 0:
+                minutes, seconds = divmod(int(remaining), 60)
+                return None, f"<b>⏳ Класс ещё не готов. Попробуй через {minutes} мин {seconds} сек.</b>"
+
+            if balance < CLASS_SPIN_COST:
+                return None, f"<b>💰 Не хватает монет. Нужно {CLASS_SPIN_COST}, у тебя {balance}.</b>"
+
+            await conn.execute(
+                """
+                INSERT INTO chat_profiles (chat_id, user_id, name, power, money, opens, last_open, last_class)
+                VALUES ($1, $2, $3, $4, $5, 0, 0, $6)
+                ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    power = chat_profiles.power + EXCLUDED.power,
+                    money = chat_profiles.money + EXCLUDED.money,
+                    last_class = EXCLUDED.last_class
+                """,
+                chat_id, user.id, user.full_name, card["power"], -CLASS_SPIN_COST, now,
+            )
+
+    caption = (
+        f"<b>🎓 <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> крутит класс!\n\n"
+        f"🃏 {card_title(card)}</b>\n"
+        f"{rarity_display(card['rarity'])}\n\n"
+        f"<b>⚔️ +{card['power']} силы\n"
+        f"💰 −{CLASS_SPIN_COST} монет</b>"
     )
     return card["photo_id"], caption
 
@@ -774,6 +930,245 @@ async def piggy_remove_pick(callback: CallbackQuery, pool: asyncpg.Pool):
         await callback.message.edit_text(piggy_menu_text(0), reply_markup=piggy_menu_kb())
 
 
+# — Класс (та же структура, что копилка, только без денег) —
+
+@router.callback_query(F.data == "class:menu", IsAdminPrivate())
+async def class_menu_cb(callback: CallbackQuery, pool: asyncpg.Pool):
+    total = await class_cards_count(pool)
+    await callback.message.edit_text(class_menu_text(total), reply_markup=class_menu_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "class:cancel", IsAdminPrivate())
+async def class_cancel(callback: CallbackQuery, state: FSMContext, pool: asyncpg.Pool):
+    await state.clear()
+    total = await class_cards_count(pool)
+    await callback.message.edit_text(class_menu_text(total), reply_markup=class_menu_kb())
+    await callback.answer("Отменено")
+
+
+@router.callback_query(F.data == "class:list", IsAdminPrivate())
+async def class_list_cb(callback: CallbackQuery, pool: asyncpg.Pool):
+    cards = await list_class_cards(pool)
+    if not cards:
+        await callback.answer("Карточек пока нет", show_alert=True)
+        return
+    lines = ["<b>📋 Список карточек</b>", ""]
+    for i, card in enumerate(cards, start=1):
+        lines.append(f"<b>{i}. {card_title(card)}</b> — {rarity_display(card['rarity'])}\n<b>    ⚔️{card['power']}</b>")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ Назад", callback_data="class:menu")
+    await callback.message.edit_text("\n".join(lines), reply_markup=kb.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "class:add", IsAdminPrivate())
+async def class_add_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AddClassCard.photo)
+    await callback.message.edit_text("<b>📸 Пришли фото карточки</b>", reply_markup=cancel_kb("class:cancel"))
+    await callback.answer()
+
+
+@router.message(AddClassCard.photo, IsAdminPrivate())
+async def class_add_photo(message: Message, state: FSMContext):
+    if not message.photo:
+        await message.answer("<b>Пришли именно фото 🙂</b>")
+        return
+    await state.update_data(photo_id=message.photo[-1].file_id)
+    await state.set_state(AddClassCard.name)
+    await message.answer("<b>✏️ Введи название карточки</b>", reply_markup=cancel_kb("class:cancel"))
+
+
+@router.message(AddClassCard.name, IsAdminPrivate())
+async def class_add_name(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("<b>Название не может быть пустым, попробуй ещё раз.</b>")
+        return
+    await state.update_data(name=name)
+    await state.set_state(AddClassCard.power)
+    await message.answer("<b>⚔️ Введи силу карточки (число)</b>", reply_markup=cancel_kb("class:cancel"))
+
+
+@router.message(AddClassCard.power, IsAdminPrivate())
+async def class_add_power(message: Message, state: FSMContext):
+    try:
+        power = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("<b>Нужно целое число, попробуй ещё раз.</b>")
+        return
+    await state.update_data(power=power)
+    await state.set_state(AddClassCard.rarity)
+    await message.answer(
+        "<b>⭐ Выбери количество звёзд карточки:</b>",
+        reply_markup=rarity_pick_kb("class:addrarity", "class:cancel"),
+    )
+
+
+@router.callback_query(AddClassCard.rarity, F.data.startswith("class:addrarity:"), IsAdminPrivate())
+async def class_add_rarity_pick(callback: CallbackQuery, state: FSMContext):
+    rarity = int(callback.data.split(":")[2])
+    await state.update_data(rarity=rarity)
+    await state.set_state(AddClassCard.bird)
+    await callback.message.edit_text(
+        "<b>🐦 Выбери птицу карточки:</b>",
+        reply_markup=bird_pick_kb("class:addbird", "class:cancel"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(AddClassCard.bird, F.data.startswith("class:addbird:"), IsAdminPrivate())
+async def class_add_bird_pick(callback: CallbackQuery, state: FSMContext, pool: asyncpg.Pool):
+    bird = int(callback.data.split(":")[2])
+    data = await state.get_data()
+    await add_class_card(pool, data["name"], data["power"], data["photo_id"], data["rarity"], bird)
+    await state.clear()
+
+    card = {"name": data["name"], "power": data["power"], "rarity": data["rarity"], "bird": bird}
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer_photo(data["photo_id"], caption=class_card_caption(card, "✅ Карточка добавлена!"))
+    total = await class_cards_count(pool)
+    await callback.message.answer(class_menu_text(total), reply_markup=class_menu_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "class:edit", IsAdminPrivate())
+async def class_edit_list(callback: CallbackQuery, pool: asyncpg.Pool):
+    cards = await list_class_cards(pool)
+    if not cards:
+        await callback.answer("Карточек пока нет", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "<b>✏️ Выбери карточку для изменения:</b>", reply_markup=cards_pick_kb(cards, "edit", "class")
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("class:edit:"), IsAdminPrivate())
+async def class_edit_pick(callback: CallbackQuery, pool: asyncpg.Pool):
+    card_id = int(callback.data.split(":")[2])
+    card = await get_class_card(pool, card_id)
+    if not card:
+        await callback.answer("Карточка не найдена", show_alert=True)
+        return
+    await callback.message.edit_text(class_card_caption(card, "Что изменить?"), reply_markup=class_edit_fields_kb(card_id))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("class:editfield:"), IsAdminPrivate())
+async def class_editfield_start(callback: CallbackQuery, state: FSMContext):
+    _, _, card_id, field = callback.data.split(":")
+    if field == "rarity":
+        await callback.message.edit_text(
+            "<b>⭐ Выбери количество звёзд:</b>",
+            reply_markup=rarity_pick_kb(f"class:setrarity:{card_id}", f"class:edit:{card_id}"),
+        )
+        await callback.answer()
+        return
+    if field == "bird":
+        await callback.message.edit_text(
+            "<b>🐦 Выбери птицу:</b>",
+            reply_markup=bird_pick_kb(f"class:setbird:{card_id}", f"class:edit:{card_id}"),
+        )
+        await callback.answer()
+        return
+    await state.set_state(EditClassCard.waiting_value)
+    await state.update_data(card_id=int(card_id), field=field)
+    await callback.message.edit_text(CLASS_FIELD_PROMPTS[field], reply_markup=cancel_kb("class:cancel"))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("class:setrarity:"), IsAdminPrivate())
+async def class_set_rarity(callback: CallbackQuery, pool: asyncpg.Pool):
+    _, _, card_id, rarity = callback.data.split(":")
+    await update_class_card_field(pool, int(card_id), "rarity", int(rarity))
+
+    card = await get_class_card(pool, int(card_id))
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer_photo(
+        card["photo_id"],
+        caption=class_card_caption(card, "✅ Карточка обновлена!"),
+        reply_markup=class_edit_fields_kb(int(card_id)),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("class:setbird:"), IsAdminPrivate())
+async def class_set_bird(callback: CallbackQuery, pool: asyncpg.Pool):
+    _, _, card_id, bird = callback.data.split(":")
+    await update_class_card_field(pool, int(card_id), "bird", int(bird))
+
+    card = await get_class_card(pool, int(card_id))
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer_photo(
+        card["photo_id"],
+        caption=class_card_caption(card, "✅ Карточка обновлена!"),
+        reply_markup=class_edit_fields_kb(int(card_id)),
+    )
+    await callback.answer()
+
+
+@router.message(EditClassCard.waiting_value, IsAdminPrivate())
+async def class_editfield_value(message: Message, state: FSMContext, pool: asyncpg.Pool):
+    data = await state.get_data()
+    field = data["field"]
+    card_id = data["card_id"]
+
+    if field == "photo_id":
+        if not message.photo:
+            await message.answer("<b>Пришли именно фото 🙂</b>")
+            return
+        value = message.photo[-1].file_id
+    elif field == "power":
+        try:
+            value = int((message.text or "").strip())
+        except ValueError:
+            await message.answer("<b>Нужно целое число, попробуй ещё раз.</b>")
+            return
+    else:
+        value = (message.text or "").strip()
+        if not value:
+            await message.answer("<b>Название не может быть пустым, попробуй ещё раз.</b>")
+            return
+
+    await update_class_card_field(pool, card_id, field, value)
+    await state.clear()
+
+    card = await get_class_card(pool, card_id)
+    await message.answer_photo(
+        card["photo_id"],
+        caption=class_card_caption(card, "✅ Карточка обновлена!"),
+        reply_markup=class_edit_fields_kb(card_id),
+    )
+
+
+@router.callback_query(F.data == "class:remove", IsAdminPrivate())
+async def class_remove_list(callback: CallbackQuery, pool: asyncpg.Pool):
+    cards = await list_class_cards(pool)
+    if not cards:
+        await callback.answer("Карточек пока нет", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "<b>🗑 Выбери карточку для удаления:</b>", reply_markup=cards_pick_kb(cards, "remove", "class")
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("class:remove:"), IsAdminPrivate())
+async def class_remove_pick(callback: CallbackQuery, pool: asyncpg.Pool):
+    card_id = int(callback.data.split(":")[2])
+    name = await delete_class_card(pool, card_id)
+    await callback.answer(f"Удалено: {name}" if name else "Уже удалено")
+
+    cards = await list_class_cards(pool)
+    if cards:
+        await callback.message.edit_text(
+            "<b>🗑 Выбери карточку для удаления:</b>", reply_markup=cards_pick_kb(cards, "remove", "class")
+        )
+    else:
+        await callback.message.edit_text(class_menu_text(0), reply_markup=class_menu_kb())
+
+
 # — Профиль игрока —
 
 def profile_text(user, summary: dict) -> str:
@@ -820,6 +1215,15 @@ async def cmd_angry_open(message: Message, bot: Bot, pool: asyncpg.Pool):
         await message.answer(text)
 
 
+@router.message(Command("angryclass", ignore_case=True), GROUP_CHATS)
+async def cmd_angry_class(message: Message, bot: Bot, pool: asyncpg.Pool):
+    photo_id, text = await perform_class(pool, message.chat.id, message.from_user)
+    if photo_id:
+        await bot.send_photo(message.chat.id, photo_id, caption=text)
+    else:
+        await message.answer(text)
+
+
 @router.message(Command("angrytop", ignore_case=True), GROUP_CHATS)
 async def cmd_angry_top(message: Message, pool: asyncpg.Pool):
     await message.answer(await perform_top(pool, message.chat.id))
@@ -828,6 +1232,16 @@ async def cmd_angry_top(message: Message, pool: asyncpg.Pool):
 @router.callback_query(F.data == "group:open", GROUP_CHATS)
 async def cb_group_open(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
     photo_id, text = await perform_open(pool, callback.message.chat.id, callback.from_user)
+    if photo_id:
+        await bot.send_photo(callback.message.chat.id, photo_id, caption=text)
+    else:
+        await callback.message.answer(text)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "group:class", GROUP_CHATS)
+async def cb_group_class(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
+    photo_id, text = await perform_class(pool, callback.message.chat.id, callback.from_user)
     if photo_id:
         await bot.send_photo(callback.message.chat.id, photo_id, caption=text)
     else:
@@ -877,6 +1291,7 @@ async def set_bot_commands(bot: Bot) -> None:
     await bot.set_my_commands(
         [
             BotCommand(command="angryopen", description="крутануть копилку"),
+            BotCommand(command="angryclass", description="крутануть класс"),
             BotCommand(command="angrytop", description="открыть лидерборд"),
         ],
         scope=BotCommandScopeAllGroupChats(),
