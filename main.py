@@ -40,7 +40,7 @@ NON_ADMIN_PRIVATE_TEXT = (
     "Добавь меня в чат и используй там команды /AngryOpen и /AngryTop.</b>"
 )
 
-CARD_FIELDS = ("name", "power", "money", "photo_id", "rarity")
+CARD_FIELDS = ("name", "power", "money", "photo_id", "rarity", "bird")
 FIELD_PROMPTS = {
     "photo_id": "<b>📸 Пришли новое фото карточки</b>",
     "name": "<b>✏️ Введи новое название карточки</b>",
@@ -88,6 +88,37 @@ def rarity_pick_kb(callback_prefix: str, back_callback: str):
     return kb.as_markup()
 
 
+# ── Птица карточки ───────────────────────────────────────────────────────
+
+DEFAULT_BIRD = 3  # 🔴 — для карточек, у которых птица ещё не задана
+
+BIRD_EMOJI = {
+    1: ("5224291536161781723", "🔵"),
+    2: ("5226789141248778924", "⚪️"),
+    3: ("5224255866458384390", "🔴"),
+    4: ("5224309386045857033", "🟡"),
+    5: ("5226870591008581314", "⚫️"),
+}
+
+
+def bird_html(bird: int) -> str:
+    emoji_id, fallback = BIRD_EMOJI[bird]
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
+
+def card_title(card: dict) -> str:
+    return f"{html.escape(card['name'])} ({bird_html(card['bird'])})"
+
+
+def bird_pick_kb(callback_prefix: str, back_callback: str):
+    kb = InlineKeyboardBuilder()
+    for code, (_, fallback) in BIRD_EMOJI.items():
+        kb.button(text=fallback, callback_data=f"{callback_prefix}:{code}")
+    kb.button(text="⬅️ Назад", callback_data=back_callback)
+    kb.adjust(5, 1)
+    return kb.as_markup()
+
+
 router = Router()
 
 
@@ -108,10 +139,12 @@ SCHEMA_STATEMENTS = (
         power BIGINT NOT NULL,
         money BIGINT NOT NULL,
         photo_id TEXT NOT NULL,
-        rarity SMALLINT NOT NULL DEFAULT 1
+        rarity SMALLINT NOT NULL DEFAULT 1,
+        bird SMALLINT NOT NULL DEFAULT 3
     )
     """,
     "ALTER TABLE cards ADD COLUMN IF NOT EXISTS rarity SMALLINT NOT NULL DEFAULT 1",
+    "ALTER TABLE cards ADD COLUMN IF NOT EXISTS bird SMALLINT NOT NULL DEFAULT 3",
     """
     CREATE TABLE IF NOT EXISTS chat_profiles (
         chat_id BIGINT NOT NULL,
@@ -128,11 +161,13 @@ SCHEMA_STATEMENTS = (
     CREATE TABLE IF NOT EXISTS chat_owners (
         chat_id BIGINT PRIMARY KEY,
         owner_id BIGINT NOT NULL,
+        owner_name TEXT NOT NULL,
         chat_title TEXT NOT NULL,
-        notified BOOLEAN NOT NULL DEFAULT FALSE,
-        earned NUMERIC(20, 4) NOT NULL DEFAULT 0
+        notified BOOLEAN NOT NULL DEFAULT FALSE
     )
     """,
+    "ALTER TABLE chat_owners ADD COLUMN IF NOT EXISTS owner_name TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE chat_owners DROP COLUMN IF EXISTS earned",
 )
 
 
@@ -153,7 +188,7 @@ async def ensure_admin(pool: asyncpg.Pool, user_id: int) -> None:
 
 
 async def list_cards(pool: asyncpg.Pool) -> list[dict]:
-    rows = await pool.fetch("SELECT id, name, power, money, photo_id, rarity FROM cards ORDER BY id")
+    rows = await pool.fetch("SELECT id, name, power, money, photo_id, rarity, bird FROM cards ORDER BY id")
     return [dict(row) for row in rows]
 
 
@@ -163,15 +198,17 @@ async def cards_count(pool: asyncpg.Pool) -> int:
 
 async def get_card(pool: asyncpg.Pool, card_id: int) -> dict | None:
     row = await pool.fetchrow(
-        "SELECT id, name, power, money, photo_id, rarity FROM cards WHERE id = $1", card_id
+        "SELECT id, name, power, money, photo_id, rarity, bird FROM cards WHERE id = $1", card_id
     )
     return dict(row) if row else None
 
 
-async def add_card(pool: asyncpg.Pool, name: str, power: int, money: int, photo_id: str, rarity: int) -> None:
+async def add_card(
+    pool: asyncpg.Pool, name: str, power: int, money: int, photo_id: str, rarity: int, bird: int
+) -> None:
     await pool.execute(
-        "INSERT INTO cards (name, power, money, photo_id, rarity) VALUES ($1, $2, $3, $4, $5)",
-        name, power, money, photo_id, rarity,
+        "INSERT INTO cards (name, power, money, photo_id, rarity, bird) VALUES ($1, $2, $3, $4, $5, $6)",
+        name, power, money, photo_id, rarity, bird,
     )
 
 
@@ -185,16 +222,18 @@ async def delete_card(pool: asyncpg.Pool, card_id: int) -> str | None:
     return await pool.fetchval("DELETE FROM cards WHERE id = $1 RETURNING name", card_id)
 
 
-async def register_chat_owner(pool: asyncpg.Pool, chat_id: int, owner_id: int, chat_title: str) -> bool:
+async def register_chat_owner(
+    pool: asyncpg.Pool, chat_id: int, owner_id: int, owner_name: str, chat_title: str
+) -> bool:
     """Возвращает True, если запись создана впервые (группа ещё не была зарегистрирована)."""
     inserted = await pool.fetchval(
         """
-        INSERT INTO chat_owners (chat_id, owner_id, chat_title)
-        VALUES ($1, $2, $3)
+        INSERT INTO chat_owners (chat_id, owner_id, owner_name, chat_title)
+        VALUES ($1, $2, $3, $4)
         ON CONFLICT (chat_id) DO NOTHING
         RETURNING chat_id
         """,
-        chat_id, owner_id, chat_title,
+        chat_id, owner_id, owner_name, chat_title,
     )
     return inserted is not None
 
@@ -206,14 +245,6 @@ async def mark_owner_notified(pool: asyncpg.Pool, chat_id: int) -> None:
 async def get_pending_owner_chats(pool: asyncpg.Pool, owner_id: int) -> list[dict]:
     rows = await pool.fetch(
         "SELECT chat_id, chat_title FROM chat_owners WHERE owner_id = $1 AND notified = FALSE",
-        owner_id,
-    )
-    return [dict(row) for row in rows]
-
-
-async def get_owner_earnings(pool: asyncpg.Pool, owner_id: int) -> list[dict]:
-    rows = await pool.fetch(
-        "SELECT chat_title, earned FROM chat_owners WHERE owner_id = $1 ORDER BY earned DESC",
         owner_id,
     )
     return [dict(row) for row in rows]
@@ -235,14 +266,14 @@ async def get_player_summary(pool: asyncpg.Pool, user_id: int) -> dict:
     return dict(row)
 
 
-async def get_chat_creator_id(bot: Bot, chat_id: int) -> int | None:
+async def get_chat_creator(bot: Bot, chat_id: int) -> tuple[int, str] | None:
     try:
         admins = await bot.get_chat_administrators(chat_id)
     except TelegramAPIError:
         return None
     for member in admins:
         if member.status == "creator":
-            return member.user.id
+            return member.user.id, member.user.full_name
     return None
 
 
@@ -296,6 +327,7 @@ class AddCard(StatesGroup):
     power = State()
     money = State()
     rarity = State()
+    bird = State()
 
 
 class EditCard(StatesGroup):
@@ -352,8 +384,9 @@ def edit_fields_kb(card_id: int):
     kb.button(text="⚔️ Сила", callback_data=f"piggy:editfield:{card_id}:power")
     kb.button(text="💰 Деньги", callback_data=f"piggy:editfield:{card_id}:money")
     kb.button(text="⭐ Звёзды", callback_data=f"piggy:editfield:{card_id}:rarity")
+    kb.button(text="🐦 Птица", callback_data=f"piggy:editfield:{card_id}:bird")
     kb.button(text="⬅️ Назад", callback_data="piggy:edit")
-    kb.adjust(2, 2, 1, 1)
+    kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -368,7 +401,7 @@ def group_menu_kb():
 def card_caption(card: dict, prefix: str) -> str:
     return (
         f"<b>{prefix}\n\n"
-        f"🃏 {html.escape(card['name'])}</b>\n"
+        f"🃏 {card_title(card)}</b>\n"
         f"{rarity_display(card['rarity'])}\n"
         f"<b>⚔️ Сила: {card['power']}\n"
         f"💰 Денег: {card['money']}</b>"
@@ -382,7 +415,7 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
     async with pool.acquire() as conn:
         async with conn.transaction():
             card = await conn.fetchrow(
-                "SELECT name, power, money, photo_id, rarity FROM cards ORDER BY random() LIMIT 1"
+                "SELECT name, power, money, photo_id, rarity, bird FROM cards ORDER BY random() LIMIT 1"
             )
             if card is None:
                 return None, "<b>🕳 Копилка пока пуста — админ ещё не добавил карточки.</b>"
@@ -411,15 +444,25 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
                 chat_id, user.id, user.full_name, card["power"], card["money"], now,
             )
 
-            # Реферальные 1% владельцу группы — начисляются молча, без уведомлений.
-            await conn.execute(
-                "UPDATE chat_owners SET earned = earned + ($1::numeric / 100) WHERE chat_id = $2",
-                card["money"], chat_id,
-            )
+            # Реферальные 1% владельцу группы — прибавляются прямо к его основным
+            # деньгам (не отдельным счётчиком), молча, без уведомлений.
+            referral_amount = round(card["money"] * 0.01)
+            if referral_amount > 0:
+                await conn.execute(
+                    """
+                    INSERT INTO chat_profiles (chat_id, user_id, name, power, money, opens, last_open)
+                    SELECT $2, o.owner_id, o.owner_name, 0, $1, 0, 0
+                    FROM chat_owners o
+                    WHERE o.chat_id = $2
+                    ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                        money = chat_profiles.money + EXCLUDED.money
+                    """,
+                    referral_amount, chat_id,
+                )
 
     caption = (
         f"<b>🎉 <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> крутит копилку!\n\n"
-        f"🃏 {html.escape(card['name'])}</b>\n"
+        f"🃏 {card_title(card)}</b>\n"
         f"{rarity_display(card['rarity'])}\n\n"
         f"<b>⚔️ +{card['power']} силы\n"
         f"💰 +{card['money']} монет</b>"
@@ -490,7 +533,7 @@ async def piggy_list_cb(callback: CallbackQuery, pool: asyncpg.Pool):
     lines = ["<b>📋 Список карточек</b>", ""]
     for i, card in enumerate(cards, start=1):
         lines.append(
-            f"<b>{i}. {html.escape(card['name'])}</b> — {rarity_display(card['rarity'])}\n"
+            f"<b>{i}. {card_title(card)}</b> — {rarity_display(card['rarity'])}\n"
             f"<b>    ⚔️{card['power']} · 💰{card['money']}</b>"
         )
     kb = InlineKeyboardBuilder()
@@ -558,13 +601,31 @@ async def add_money(message: Message, state: FSMContext, pool: asyncpg.Pool):
 
 
 @router.callback_query(AddCard.rarity, F.data.startswith("piggy:addrarity:"), IsAdminPrivate())
-async def add_rarity_pick(callback: CallbackQuery, state: FSMContext, pool: asyncpg.Pool):
+async def add_rarity_pick(callback: CallbackQuery, state: FSMContext):
     rarity = int(callback.data.split(":")[2])
+    await state.update_data(rarity=rarity)
+    await state.set_state(AddCard.bird)
+    await callback.message.edit_text(
+        "<b>🐦 Выбери птицу карточки:</b>",
+        reply_markup=bird_pick_kb("piggy:addbird", "piggy:cancel"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(AddCard.bird, F.data.startswith("piggy:addbird:"), IsAdminPrivate())
+async def add_bird_pick(callback: CallbackQuery, state: FSMContext, pool: asyncpg.Pool):
+    bird = int(callback.data.split(":")[2])
     data = await state.get_data()
-    await add_card(pool, data["name"], data["power"], data["money"], data["photo_id"], rarity)
+    await add_card(pool, data["name"], data["power"], data["money"], data["photo_id"], data["rarity"], bird)
     await state.clear()
 
-    card = {"name": data["name"], "power": data["power"], "money": data["money"], "rarity": rarity}
+    card = {
+        "name": data["name"],
+        "power": data["power"],
+        "money": data["money"],
+        "rarity": data["rarity"],
+        "bird": bird,
+    }
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer_photo(data["photo_id"], caption=card_caption(card, "✅ Карточка добавлена!"))
     total = await cards_count(pool)
@@ -607,6 +668,13 @@ async def piggy_editfield_start(callback: CallbackQuery, state: FSMContext):
         )
         await callback.answer()
         return
+    if field == "bird":
+        await callback.message.edit_text(
+            "<b>🐦 Выбери птицу:</b>",
+            reply_markup=bird_pick_kb(f"piggy:setbird:{card_id}", f"piggy:edit:{card_id}"),
+        )
+        await callback.answer()
+        return
     await state.set_state(EditCard.waiting_value)
     await state.update_data(card_id=int(card_id), field=field)
     await callback.message.edit_text(FIELD_PROMPTS[field], reply_markup=cancel_kb())
@@ -617,6 +685,21 @@ async def piggy_editfield_start(callback: CallbackQuery, state: FSMContext):
 async def piggy_set_rarity(callback: CallbackQuery, pool: asyncpg.Pool):
     _, _, card_id, rarity = callback.data.split(":")
     await update_card_field(pool, int(card_id), "rarity", int(rarity))
+
+    card = await get_card(pool, int(card_id))
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer_photo(
+        card["photo_id"],
+        caption=card_caption(card, "✅ Карточка обновлена!"),
+        reply_markup=edit_fields_kb(int(card_id)),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("piggy:setbird:"), IsAdminPrivate())
+async def piggy_set_bird(callback: CallbackQuery, pool: asyncpg.Pool):
+    _, _, card_id, bird = callback.data.split(":")
+    await update_card_field(pool, int(card_id), "bird", int(bird))
 
     card = await get_card(pool, int(card_id))
     await callback.message.edit_reply_markup(reply_markup=None)
@@ -693,8 +776,8 @@ async def piggy_remove_pick(callback: CallbackQuery, pool: asyncpg.Pool):
 
 # — Профиль игрока —
 
-def profile_text(user, summary: dict, owner_rows: list[dict]) -> str:
-    if summary["chats"] == 0 and not owner_rows:
+def profile_text(user, summary: dict) -> str:
+    if summary["chats"] == 0:
         return (
             "<b>👤 Профиль\n\n"
             "Ты пока не крутил копилку ни в одной группе.\n"
@@ -709,21 +792,13 @@ def profile_text(user, summary: dict, owner_rows: list[dict]) -> str:
         f"🎰 Круток копилки: {summary['opens']}",
         f"👥 Групп с игрой: {summary['chats']}",
     ]
-    if owner_rows:
-        total_earned = sum(row["earned"] for row in owner_rows)
-        lines += [
-            "",
-            f"💼 Реферальный доход (1% с групп): {total_earned:.2f} монет",
-            f"   Подключено групп: {len(owner_rows)}",
-        ]
     return "<b>" + "\n".join(lines) + "</b>"
 
 
 @router.message(F.chat.type == "private")
 async def show_profile(message: Message, pool: asyncpg.Pool):
     summary = await get_player_summary(pool, message.from_user.id)
-    owner_rows = await get_owner_earnings(pool, message.from_user.id)
-    await message.answer(profile_text(message.from_user, summary, owner_rows))
+    await message.answer(profile_text(message.from_user, summary))
 
 
 # ── Групповые команды ─────────────────────────────────────────────────────
@@ -775,12 +850,13 @@ async def on_bot_added(event: ChatMemberUpdated, bot: Bot, pool: asyncpg.Pool):
     if old_status not in ("left", "kicked") or new_status not in ("member", "administrator"):
         return
 
-    owner_id = await get_chat_creator_id(bot, event.chat.id)
-    if owner_id is None:
+    creator = await get_chat_creator(bot, event.chat.id)
+    if creator is None:
         return
+    owner_id, owner_name = creator
 
     title = event.chat.title or "группа"
-    is_new = await register_chat_owner(pool, event.chat.id, owner_id, title)
+    is_new = await register_chat_owner(pool, event.chat.id, owner_id, owner_name, title)
     if not is_new:
         return
 
