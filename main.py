@@ -8,7 +8,7 @@ import asyncpg
 from aiogram import Bot, BaseMiddleware, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -645,6 +645,16 @@ async def perform_top(pool: asyncpg.Pool, chat_id: int) -> str:
     return "\n".join(lines) + "</b>"
 
 
+async def safe_edit_text(message: Message, text: str, reply_markup=None) -> None:
+    """edit_text не может превратить фото-сообщение в текстовое — в этом случае
+    пересоздаём сообщение вместо падения (отсюда были нерабочие кнопки)."""
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest:
+        await message.delete()
+        await message.answer(text, reply_markup=reply_markup)
+
+
 # ── Приватные сообщения (админ-панель) ───────────────────────────────────
 
 @router.message(CommandStart(), F.chat.type == "private")
@@ -659,14 +669,14 @@ async def cmd_start_private(message: Message, state: FSMContext, pool: asyncpg.P
 
 @router.callback_query(F.data == "admin:menu", IsAdminPrivate())
 async def admin_menu_cb(callback: CallbackQuery):
-    await callback.message.edit_text(admin_menu_text(), reply_markup=admin_menu_kb())
+    await safe_edit_text(callback.message, admin_menu_text(), reply_markup=admin_menu_kb())
     await callback.answer()
 
 
 @router.callback_query(F.data == "piggy:menu", IsAdminPrivate())
 async def piggy_menu_cb(callback: CallbackQuery, pool: asyncpg.Pool):
     total = await cards_count(pool)
-    await callback.message.edit_text(piggy_menu_text(total), reply_markup=piggy_menu_kb())
+    await safe_edit_text(callback.message, piggy_menu_text(total), reply_markup=piggy_menu_kb())
     await callback.answer()
 
 
@@ -674,7 +684,7 @@ async def piggy_menu_cb(callback: CallbackQuery, pool: asyncpg.Pool):
 async def piggy_cancel(callback: CallbackQuery, state: FSMContext, pool: asyncpg.Pool):
     await state.clear()
     total = await cards_count(pool)
-    await callback.message.edit_text(piggy_menu_text(total), reply_markup=piggy_menu_kb())
+    await safe_edit_text(callback.message, piggy_menu_text(total), reply_markup=piggy_menu_kb())
     await callback.answer("Отменено")
 
 
@@ -694,7 +704,7 @@ async def piggy_list_cb(callback: CallbackQuery, pool: asyncpg.Pool):
         )
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ Назад", callback_data="piggy:menu")
-    await callback.message.edit_text("\n".join(lines), reply_markup=kb.as_markup())
+    await safe_edit_text(callback.message, "\n".join(lines), reply_markup=kb.as_markup())
     await callback.answer()
 
 
@@ -703,7 +713,7 @@ async def piggy_list_cb(callback: CallbackQuery, pool: asyncpg.Pool):
 @router.callback_query(F.data == "piggy:add", IsAdminPrivate())
 async def piggy_add_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AddCard.photo)
-    await callback.message.edit_text("<b>📸 Пришли фото карточки</b>", reply_markup=cancel_kb())
+    await safe_edit_text(callback.message, "<b>📸 Пришли фото карточки</b>", reply_markup=cancel_kb())
     await callback.answer()
 
 
@@ -761,7 +771,7 @@ async def add_rarity_pick(callback: CallbackQuery, state: FSMContext):
     rarity = int(callback.data.split(":")[2])
     await state.update_data(rarity=rarity)
     await state.set_state(AddCard.bird)
-    await callback.message.edit_text(
+    await safe_edit_text(callback.message, 
         "<b>🐦 Выбери птицу карточки:</b>",
         reply_markup=bird_pick_kb("piggy:addbird", "piggy:cancel"),
     )
@@ -797,7 +807,7 @@ async def piggy_edit_list(callback: CallbackQuery, pool: asyncpg.Pool):
     if not cards:
         await callback.answer("Карточек пока нет", show_alert=True)
         return
-    await callback.message.edit_text(
+    await safe_edit_text(callback.message, 
         "<b>✏️ Выбери карточку для изменения:</b>", reply_markup=cards_pick_kb(cards, "edit")
     )
     await callback.answer()
@@ -810,7 +820,7 @@ async def piggy_edit_pick(callback: CallbackQuery, pool: asyncpg.Pool):
     if not card:
         await callback.answer("Карточка не найдена", show_alert=True)
         return
-    await callback.message.edit_text(card_caption(card, "Что изменить?"), reply_markup=edit_fields_kb(card_id))
+    await safe_edit_text(callback.message, card_caption(card, "Что изменить?"), reply_markup=edit_fields_kb(card_id))
     await callback.answer()
 
 
@@ -818,14 +828,14 @@ async def piggy_edit_pick(callback: CallbackQuery, pool: asyncpg.Pool):
 async def piggy_editfield_start(callback: CallbackQuery, state: FSMContext):
     _, _, card_id, field = callback.data.split(":")
     if field == "rarity":
-        await callback.message.edit_text(
+        await safe_edit_text(callback.message, 
             "<b>⭐ Выбери количество звёзд:</b>",
             reply_markup=rarity_pick_kb(f"piggy:setrarity:{card_id}", f"piggy:edit:{card_id}"),
         )
         await callback.answer()
         return
     if field == "bird":
-        await callback.message.edit_text(
+        await safe_edit_text(callback.message, 
             "<b>🐦 Выбери птицу:</b>",
             reply_markup=bird_pick_kb(f"piggy:setbird:{card_id}", f"piggy:edit:{card_id}"),
         )
@@ -833,7 +843,7 @@ async def piggy_editfield_start(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(EditCard.waiting_value)
     await state.update_data(card_id=int(card_id), field=field)
-    await callback.message.edit_text(FIELD_PROMPTS[field], reply_markup=cancel_kb())
+    await safe_edit_text(callback.message, FIELD_PROMPTS[field], reply_markup=cancel_kb())
     await callback.answer()
 
 
@@ -909,7 +919,7 @@ async def piggy_remove_list(callback: CallbackQuery, pool: asyncpg.Pool):
     if not cards:
         await callback.answer("Карточек пока нет", show_alert=True)
         return
-    await callback.message.edit_text(
+    await safe_edit_text(callback.message, 
         "<b>🗑 Выбери карточку для удаления:</b>", reply_markup=cards_pick_kb(cards, "remove")
     )
     await callback.answer()
@@ -923,11 +933,11 @@ async def piggy_remove_pick(callback: CallbackQuery, pool: asyncpg.Pool):
 
     cards = await list_cards(pool)
     if cards:
-        await callback.message.edit_text(
+        await safe_edit_text(callback.message, 
             "<b>🗑 Выбери карточку для удаления:</b>", reply_markup=cards_pick_kb(cards, "remove")
         )
     else:
-        await callback.message.edit_text(piggy_menu_text(0), reply_markup=piggy_menu_kb())
+        await safe_edit_text(callback.message, piggy_menu_text(0), reply_markup=piggy_menu_kb())
 
 
 # — Класс (та же структура, что копилка, только без денег) —
@@ -935,7 +945,7 @@ async def piggy_remove_pick(callback: CallbackQuery, pool: asyncpg.Pool):
 @router.callback_query(F.data == "class:menu", IsAdminPrivate())
 async def class_menu_cb(callback: CallbackQuery, pool: asyncpg.Pool):
     total = await class_cards_count(pool)
-    await callback.message.edit_text(class_menu_text(total), reply_markup=class_menu_kb())
+    await safe_edit_text(callback.message, class_menu_text(total), reply_markup=class_menu_kb())
     await callback.answer()
 
 
@@ -943,7 +953,7 @@ async def class_menu_cb(callback: CallbackQuery, pool: asyncpg.Pool):
 async def class_cancel(callback: CallbackQuery, state: FSMContext, pool: asyncpg.Pool):
     await state.clear()
     total = await class_cards_count(pool)
-    await callback.message.edit_text(class_menu_text(total), reply_markup=class_menu_kb())
+    await safe_edit_text(callback.message, class_menu_text(total), reply_markup=class_menu_kb())
     await callback.answer("Отменено")
 
 
@@ -958,14 +968,14 @@ async def class_list_cb(callback: CallbackQuery, pool: asyncpg.Pool):
         lines.append(f"<b>{i}. {card_title(card)}</b> — {rarity_display(card['rarity'])}\n<b>    ⚔️{card['power']}</b>")
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ Назад", callback_data="class:menu")
-    await callback.message.edit_text("\n".join(lines), reply_markup=kb.as_markup())
+    await safe_edit_text(callback.message, "\n".join(lines), reply_markup=kb.as_markup())
     await callback.answer()
 
 
 @router.callback_query(F.data == "class:add", IsAdminPrivate())
 async def class_add_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AddClassCard.photo)
-    await callback.message.edit_text("<b>📸 Пришли фото карточки</b>", reply_markup=cancel_kb("class:cancel"))
+    await safe_edit_text(callback.message, "<b>📸 Пришли фото карточки</b>", reply_markup=cancel_kb("class:cancel"))
     await callback.answer()
 
 
@@ -1010,7 +1020,7 @@ async def class_add_rarity_pick(callback: CallbackQuery, state: FSMContext):
     rarity = int(callback.data.split(":")[2])
     await state.update_data(rarity=rarity)
     await state.set_state(AddClassCard.bird)
-    await callback.message.edit_text(
+    await safe_edit_text(callback.message, 
         "<b>🐦 Выбери птицу карточки:</b>",
         reply_markup=bird_pick_kb("class:addbird", "class:cancel"),
     )
@@ -1038,7 +1048,7 @@ async def class_edit_list(callback: CallbackQuery, pool: asyncpg.Pool):
     if not cards:
         await callback.answer("Карточек пока нет", show_alert=True)
         return
-    await callback.message.edit_text(
+    await safe_edit_text(callback.message, 
         "<b>✏️ Выбери карточку для изменения:</b>", reply_markup=cards_pick_kb(cards, "edit", "class")
     )
     await callback.answer()
@@ -1051,7 +1061,7 @@ async def class_edit_pick(callback: CallbackQuery, pool: asyncpg.Pool):
     if not card:
         await callback.answer("Карточка не найдена", show_alert=True)
         return
-    await callback.message.edit_text(class_card_caption(card, "Что изменить?"), reply_markup=class_edit_fields_kb(card_id))
+    await safe_edit_text(callback.message, class_card_caption(card, "Что изменить?"), reply_markup=class_edit_fields_kb(card_id))
     await callback.answer()
 
 
@@ -1059,14 +1069,14 @@ async def class_edit_pick(callback: CallbackQuery, pool: asyncpg.Pool):
 async def class_editfield_start(callback: CallbackQuery, state: FSMContext):
     _, _, card_id, field = callback.data.split(":")
     if field == "rarity":
-        await callback.message.edit_text(
+        await safe_edit_text(callback.message, 
             "<b>⭐ Выбери количество звёзд:</b>",
             reply_markup=rarity_pick_kb(f"class:setrarity:{card_id}", f"class:edit:{card_id}"),
         )
         await callback.answer()
         return
     if field == "bird":
-        await callback.message.edit_text(
+        await safe_edit_text(callback.message, 
             "<b>🐦 Выбери птицу:</b>",
             reply_markup=bird_pick_kb(f"class:setbird:{card_id}", f"class:edit:{card_id}"),
         )
@@ -1074,7 +1084,7 @@ async def class_editfield_start(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(EditClassCard.waiting_value)
     await state.update_data(card_id=int(card_id), field=field)
-    await callback.message.edit_text(CLASS_FIELD_PROMPTS[field], reply_markup=cancel_kb("class:cancel"))
+    await safe_edit_text(callback.message, CLASS_FIELD_PROMPTS[field], reply_markup=cancel_kb("class:cancel"))
     await callback.answer()
 
 
@@ -1148,7 +1158,7 @@ async def class_remove_list(callback: CallbackQuery, pool: asyncpg.Pool):
     if not cards:
         await callback.answer("Карточек пока нет", show_alert=True)
         return
-    await callback.message.edit_text(
+    await safe_edit_text(callback.message, 
         "<b>🗑 Выбери карточку для удаления:</b>", reply_markup=cards_pick_kb(cards, "remove", "class")
     )
     await callback.answer()
@@ -1162,11 +1172,11 @@ async def class_remove_pick(callback: CallbackQuery, pool: asyncpg.Pool):
 
     cards = await list_class_cards(pool)
     if cards:
-        await callback.message.edit_text(
+        await safe_edit_text(callback.message, 
             "<b>🗑 Выбери карточку для удаления:</b>", reply_markup=cards_pick_kb(cards, "remove", "class")
         )
     else:
-        await callback.message.edit_text(class_menu_text(0), reply_markup=class_menu_kb())
+        await safe_edit_text(callback.message, class_menu_text(0), reply_markup=class_menu_kb())
 
 
 # — Профиль игрока —
