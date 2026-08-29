@@ -180,6 +180,28 @@ SCHEMA_STATEMENTS = (
     )
     """,
     "ALTER TABLE chat_profiles ADD COLUMN IF NOT EXISTS last_class DOUBLE PRECISION NOT NULL DEFAULT 0",
+    # Сила — общий показатель игрока на все чаты (лидерборд при этом остаётся
+    # своим для каждого чата: он ранжирует участников чата по этой общей силе).
+    """
+    CREATE TABLE IF NOT EXISTS players (
+        user_id BIGINT PRIMARY KEY,
+        power BIGINT NOT NULL DEFAULT 0
+    )
+    """,
+    """
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'chat_profiles' AND column_name = 'power'
+        ) THEN
+            INSERT INTO players (user_id, power)
+            SELECT user_id, SUM(power) FROM chat_profiles GROUP BY user_id
+            ON CONFLICT (user_id) DO NOTHING;
+        END IF;
+    END $$;
+    """,
+    "ALTER TABLE chat_profiles DROP COLUMN IF EXISTS power",
     """
     CREATE TABLE IF NOT EXISTS chat_owners (
         chat_id BIGINT PRIMARY KEY,
@@ -312,7 +334,7 @@ async def get_player_summary(pool: asyncpg.Pool, user_id: int) -> dict:
     row = await pool.fetchrow(
         """
         SELECT
-            COALESCE(SUM(power), 0) AS power,
+            COALESCE((SELECT power FROM players WHERE user_id = $1), 0) AS power,
             COALESCE(SUM(money), 0) AS money,
             COALESCE(SUM(opens), 0) AS opens,
             COUNT(*) AS chats
@@ -322,6 +344,16 @@ async def get_player_summary(pool: asyncpg.Pool, user_id: int) -> dict:
         user_id,
     )
     return dict(row)
+
+
+async def add_player_power(conn: asyncpg.Connection, user_id: int, power: int) -> None:
+    await conn.execute(
+        """
+        INSERT INTO players (user_id, power) VALUES ($1, $2)
+        ON CONFLICT (user_id) DO UPDATE SET power = players.power + EXCLUDED.power
+        """,
+        user_id, power,
+    )
 
 
 async def get_chat_creator(bot: Bot, chat_id: int) -> tuple[int, str] | None:
@@ -540,17 +572,17 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
 
             await conn.execute(
                 """
-                INSERT INTO chat_profiles (chat_id, user_id, name, power, money, opens, last_open)
-                VALUES ($1, $2, $3, $4, $5, 1, $6)
+                INSERT INTO chat_profiles (chat_id, user_id, name, money, opens, last_open)
+                VALUES ($1, $2, $3, $4, 1, $5)
                 ON CONFLICT (chat_id, user_id) DO UPDATE SET
                     name = EXCLUDED.name,
-                    power = chat_profiles.power + EXCLUDED.power,
                     money = chat_profiles.money + EXCLUDED.money,
                     opens = chat_profiles.opens + 1,
                     last_open = EXCLUDED.last_open
                 """,
-                chat_id, user.id, user.full_name, card["power"], card["money"], now,
+                chat_id, user.id, user.full_name, card["money"], now,
             )
+            await add_player_power(conn, user.id, card["power"])
 
             # Реферальные 1% владельцу группы — прибавляются прямо к его основным
             # деньгам (не отдельным счётчиком), молча, без уведомлений.
@@ -558,8 +590,8 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
             if referral_amount > 0:
                 await conn.execute(
                     """
-                    INSERT INTO chat_profiles (chat_id, user_id, name, power, money, opens, last_open)
-                    SELECT $2, o.owner_id, o.owner_name, 0, $1, 0, 0
+                    INSERT INTO chat_profiles (chat_id, user_id, name, money, opens, last_open)
+                    SELECT $2, o.owner_id, o.owner_name, $1, 0, 0
                     FROM chat_owners o
                     WHERE o.chat_id = $2
                     ON CONFLICT (chat_id, user_id) DO UPDATE SET
@@ -605,16 +637,16 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | N
 
             await conn.execute(
                 """
-                INSERT INTO chat_profiles (chat_id, user_id, name, power, money, opens, last_open, last_class)
-                VALUES ($1, $2, $3, $4, $5, 0, 0, $6)
+                INSERT INTO chat_profiles (chat_id, user_id, name, money, opens, last_open, last_class)
+                VALUES ($1, $2, $3, $4, 0, 0, $5)
                 ON CONFLICT (chat_id, user_id) DO UPDATE SET
                     name = EXCLUDED.name,
-                    power = chat_profiles.power + EXCLUDED.power,
                     money = chat_profiles.money + EXCLUDED.money,
                     last_class = EXCLUDED.last_class
                 """,
-                chat_id, user.id, user.full_name, card["power"], -CLASS_SPIN_COST, now,
+                chat_id, user.id, user.full_name, -CLASS_SPIN_COST, now,
             )
+            await add_player_power(conn, user.id, card["power"])
 
     caption = (
         f"<b>🎓 <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> крутит класс!\n\n"
@@ -628,7 +660,14 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | N
 
 async def perform_top(pool: asyncpg.Pool, chat_id: int) -> str:
     rows = await pool.fetch(
-        "SELECT name, power FROM chat_profiles WHERE chat_id = $1 ORDER BY power DESC LIMIT $2",
+        """
+        SELECT cp.name, pl.power
+        FROM chat_profiles cp
+        JOIN players pl ON pl.user_id = cp.user_id
+        WHERE cp.chat_id = $1
+        ORDER BY pl.power DESC
+        LIMIT $2
+        """,
         chat_id, TOP_LIMIT,
     )
     if not rows:
