@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import os
+import random
 import time
 
 import asyncpg
@@ -29,14 +30,21 @@ logging.basicConfig(level=logging.INFO)
 COOLDOWN_SECONDS = 60 * 60
 CLASS_COOLDOWN_SECONDS = 5 * 60
 CLASS_SPIN_COST = 10
+STEAL_COOLDOWN_SECONDS = 30 * 60
+STEAL_OUTCOME_WEIGHTS = (("success", 20), ("partial", 50), ("fail", 30))
+STEAL_SUCCESS_SHARE = 0.10
+STEAL_PARTIAL_SHARE = 0.05
+STEAL_FAIL_LOSS_SHARE = 0.05
 TOP_LIMIT = 10
 
 GROUP_INTRO_TEXT = (
     "<b>🐦 Angry Копилка\n\n"
     "Раз в час можно крутануть копилку и получить силу и монеты.\n"
-    f"За {CLASS_SPIN_COST} монет (раз в 5 минут) можно крутить класс и получить только силу.\n\n"
+    f"За {CLASS_SPIN_COST} монет (раз в 5 минут) можно крутить класс и получить только силу.\n"
+    "Ответом «кража» или /steal на чужое сообщение можно украсть монеты (раз в 30 минут).\n\n"
     "🎰 /AngryOpen — крутануть копилку\n"
     "🎓 /AngryClass — крутануть класс\n"
+    "🥷 /steal — украсть монеты (в ответ на сообщение)\n"
     "🏆 /AngryTop — топ силы чата</b>"
 )
 NON_ADMIN_PRIVATE_TEXT = (
@@ -176,10 +184,12 @@ SCHEMA_STATEMENTS = (
         opens INTEGER NOT NULL DEFAULT 0,
         last_open DOUBLE PRECISION NOT NULL DEFAULT 0,
         last_class DOUBLE PRECISION NOT NULL DEFAULT 0,
+        last_steal DOUBLE PRECISION NOT NULL DEFAULT 0,
         PRIMARY KEY (chat_id, user_id)
     )
     """,
     "ALTER TABLE chat_profiles ADD COLUMN IF NOT EXISTS last_class DOUBLE PRECISION NOT NULL DEFAULT 0",
+    "ALTER TABLE chat_profiles ADD COLUMN IF NOT EXISTS last_steal DOUBLE PRECISION NOT NULL DEFAULT 0",
     # Сила — общий показатель игрока на все чаты (лидерборд при этом остаётся
     # своим для каждого чата: он ранжирует участников чата по этой общей силе).
     """
@@ -656,6 +666,86 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | N
         f"💰 −{CLASS_SPIN_COST} монет</b>"
     )
     return card["photo_id"], caption
+
+
+async def perform_steal(pool: asyncpg.Pool, chat_id: int, thief, target) -> str:
+    now = time.time()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            thief_row = await conn.fetchrow(
+                "SELECT money, last_steal FROM chat_profiles WHERE chat_id = $1 AND user_id = $2 FOR UPDATE",
+                chat_id, thief.id,
+            )
+            thief_money = thief_row["money"] if thief_row else 0
+            last_steal = thief_row["last_steal"] if thief_row else 0
+
+            remaining = STEAL_COOLDOWN_SECONDS - (now - last_steal)
+            if remaining > 0:
+                minutes, seconds = divmod(int(remaining), 60)
+                return f"<b>⏳ Кража ещё не готова. Попробуй через {minutes} мин {seconds} сек.</b>"
+
+            target_row = await conn.fetchrow(
+                "SELECT money FROM chat_profiles WHERE chat_id = $1 AND user_id = $2 FOR UPDATE",
+                chat_id, target.id,
+            )
+            target_money = target_row["money"] if target_row else 0
+            if target_money <= 0:
+                return "<b>🕳 У этого игрока нечего воровать.</b>"
+
+            await conn.execute(
+                """
+                INSERT INTO chat_profiles (chat_id, user_id, name, money, opens, last_open, last_class, last_steal)
+                VALUES ($1, $2, $3, 0, 0, 0, 0, $4)
+                ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    last_steal = EXCLUDED.last_steal
+                """,
+                chat_id, thief.id, thief.full_name, now,
+            )
+
+            outcome = random.choices(
+                [code for code, _ in STEAL_OUTCOME_WEIGHTS],
+                weights=[weight for _, weight in STEAL_OUTCOME_WEIGHTS],
+                k=1,
+            )[0]
+
+            thief_mention = f"<a href='tg://user?id={thief.id}'>{html.escape(thief.full_name)}</a>"
+            target_mention = f"<a href='tg://user?id={target.id}'>{html.escape(target.full_name)}</a>"
+
+            if outcome in ("success", "partial"):
+                share = STEAL_SUCCESS_SHARE if outcome == "success" else STEAL_PARTIAL_SHARE
+                amount = round(target_money * share)
+                await conn.execute(
+                    "UPDATE chat_profiles SET money = money - $1 WHERE chat_id = $2 AND user_id = $3",
+                    amount, chat_id, target.id,
+                )
+                await conn.execute(
+                    "UPDATE chat_profiles SET money = money + $1 WHERE chat_id = $2 AND user_id = $3",
+                    amount, chat_id, thief.id,
+                )
+                if outcome == "success":
+                    return (
+                        f"<b>🥷 Удачная кража!\n\n"
+                        f"{thief_mention} обчистил {target_mention}\n"
+                        f"💰 Украдено: {amount}</b>"
+                    )
+                return (
+                    f"<b>🤏 Частично удачная кража!\n\n"
+                    f"{thief_mention} стащил немного у {target_mention}\n"
+                    f"💰 Украдено: {amount}</b>"
+                )
+
+            loss = round(thief_money * STEAL_FAIL_LOSS_SHARE)
+            if loss > 0:
+                await conn.execute(
+                    "UPDATE chat_profiles SET money = money - $1 WHERE chat_id = $2 AND user_id = $3",
+                    loss, chat_id, thief.id,
+                )
+            return (
+                f"<b>🚨 Неудачная кража!\n\n"
+                f"{thief_mention} попался, пытаясь обокрасть {target_mention}\n"
+                f"💰 Потеряно: {loss}</b>"
+            )
 
 
 async def perform_top(pool: asyncpg.Pool, chat_id: int) -> str:
@@ -1278,6 +1368,33 @@ async def cmd_angry_top(message: Message, pool: asyncpg.Pool):
     await message.answer(await perform_top(pool, message.chat.id))
 
 
+async def handle_steal(message: Message, pool: asyncpg.Pool) -> None:
+    reply = message.reply_to_message
+    if reply is None or reply.from_user is None:
+        await message.answer(
+            "<b>🕵️ Чтобы украсть монеты, ответь этой командой на сообщение игрока.</b>"
+        )
+        return
+    target = reply.from_user
+    if target.is_bot:
+        await message.answer("<b>🤖 У ботов красть нечего.</b>")
+        return
+    if target.id == message.from_user.id:
+        await message.answer("<b>🙃 Нельзя красть у самого себя.</b>")
+        return
+    await message.answer(await perform_steal(pool, message.chat.id, message.from_user, target))
+
+
+@router.message(Command("steal", ignore_case=True), GROUP_CHATS)
+async def cmd_steal(message: Message, pool: asyncpg.Pool):
+    await handle_steal(message, pool)
+
+
+@router.message(GROUP_CHATS, F.reply_to_message, F.text.func(lambda t: (t or "").strip().lower() == "кража"))
+async def cmd_steal_word(message: Message, pool: asyncpg.Pool):
+    await handle_steal(message, pool)
+
+
 @router.callback_query(F.data == "group:open", GROUP_CHATS)
 async def cb_group_open(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
     photo_id, text = await perform_open(pool, callback.message.chat.id, callback.from_user)
@@ -1341,6 +1458,7 @@ async def set_bot_commands(bot: Bot) -> None:
         [
             BotCommand(command="angryopen", description="крутануть копилку"),
             BotCommand(command="angryclass", description="крутануть класс"),
+            BotCommand(command="steal", description="украсть монеты (в ответ на сообщение)"),
             BotCommand(command="angrytop", description="открыть лидерборд"),
         ],
         scope=BotCommandScopeAllGroupChats(),
