@@ -1473,7 +1473,7 @@ DATABASE_URL = (
 
 
 async def main() -> None:
-    token = os.environ.get("BOT_TOKEN") or BOT_TOKEN
+    token = BOT_TOKEN or os.environ.get("BOT_TOKEN")
     dsn = os.environ.get("DATABASE_URL") or DATABASE_URL
     if not token:
         raise RuntimeError("Не найден токен бота в переменной окружения BOT_TOKEN")
