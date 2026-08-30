@@ -1,9 +1,12 @@
 import asyncio
+import hashlib
 import html
 import logging
 import os
 import random
+import subprocess
 import time
+from pathlib import Path
 
 import asyncpg
 from aiogram import Bot, BaseMiddleware, Dispatcher, F, Router
@@ -157,10 +160,12 @@ SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS bot_state (
         id SMALLINT PRIMARY KEY,
-        admin_id BIGINT
+        admin_id BIGINT,
+        last_deploy_version TEXT
     )
     """,
     "INSERT INTO bot_state (id, admin_id) VALUES (1, NULL) ON CONFLICT (id) DO NOTHING",
+    "ALTER TABLE bot_state ADD COLUMN IF NOT EXISTS last_deploy_version TEXT",
     """
     CREATE TABLE IF NOT EXISTS cards (
         id SERIAL PRIMARY KEY,
@@ -268,6 +273,14 @@ async def ensure_admin(pool: asyncpg.Pool, user_id: int) -> None:
     await pool.execute(
         "UPDATE bot_state SET admin_id = $1 WHERE id = 1 AND admin_id IS NULL", user_id
     )
+
+
+async def get_last_deploy_version(pool: asyncpg.Pool) -> str | None:
+    return await pool.fetchval("SELECT last_deploy_version FROM bot_state WHERE id = 1")
+
+
+async def set_last_deploy_version(pool: asyncpg.Pool, version: str) -> None:
+    await pool.execute("UPDATE bot_state SET last_deploy_version = $1 WHERE id = 1", version)
 
 
 async def list_cards(pool: asyncpg.Pool) -> list[dict]:
@@ -1832,6 +1845,46 @@ async def on_bot_added(event: ChatMemberUpdated, bot: Bot, pool: asyncpg.Pool):
     await mark_owner_notified(pool, event.chat.id)
 
 
+# ── Лог обновлений ───────────────────────────────────────────────────────
+
+DEPLOY_NOTIFY_CHAT = "@L1meYT"
+
+
+def get_deploy_version() -> tuple[str, str]:
+    """Возвращает (version_id, описание) — по git-коммиту, либо по хешу файла, если git недоступен."""
+    base_dir = Path(__file__).resolve().parent
+    try:
+        commit_hash = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=base_dir, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        commit_msg = subprocess.check_output(
+            ["git", "log", "-1", "--pretty=%s"], cwd=base_dir, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        commit_date = subprocess.check_output(
+            ["git", "log", "-1", "--pretty=%cd", "--date=format:%d.%m.%Y %H:%M"],
+            cwd=base_dir, text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        details = f"📝 {html.escape(commit_msg)}\n🕐 {commit_date}"
+        return commit_hash, details
+    except Exception:
+        digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:8]
+        return digest, "📝 Локальная версия (git недоступен)"
+
+
+async def notify_deploy(bot: Bot, pool: asyncpg.Pool) -> None:
+    version_id, details = get_deploy_version()
+    if await get_last_deploy_version(pool) == version_id:
+        return
+
+    text = f"<b>🚀 Angry Bank обновлён и запущен</b>\n\n{details}\n🔖 <code>{version_id}</code>"
+    try:
+        await bot.send_message(DEPLOY_NOTIFY_CHAT, text)
+    except TelegramAPIError as error:
+        logging.warning("Не удалось отправить лог обновления: %s", error)
+        return
+    await set_last_deploy_version(pool, version_id)
+
+
 # ── Запуск ───────────────────────────────────────────────────────────────
 
 async def set_bot_commands(bot: Bot) -> None:
@@ -1880,6 +1933,7 @@ async def main() -> None:
 
         await set_bot_commands(bot)
         await bot.delete_webhook(drop_pending_updates=True)
+        await notify_deploy(bot, pool)
         await dp.start_polling(bot, pool=pool)
     finally:
         await pool.close()
