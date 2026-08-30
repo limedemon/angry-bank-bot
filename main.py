@@ -283,6 +283,12 @@ SCHEMA_STATEMENTS = (
         joined_at DOUBLE PRECISION NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS bot_chats (
+        chat_id BIGINT PRIMARY KEY,
+        title TEXT NOT NULL
+    )
+    """,
 )
 
 
@@ -308,6 +314,11 @@ async def get_last_deploy_version(pool: asyncpg.Pool) -> str | None:
 
 async def set_last_deploy_version(pool: asyncpg.Pool, version: str) -> None:
     await pool.execute("UPDATE bot_state SET last_deploy_version = $1 WHERE id = 1", version)
+
+
+async def get_active_chat_ids(pool: asyncpg.Pool) -> list[int]:
+    rows = await pool.fetch("SELECT chat_id FROM bot_chats")
+    return [row["chat_id"] for row in rows]
 
 
 async def list_cards(pool: asyncpg.Pool) -> list[dict]:
@@ -652,10 +663,6 @@ class AddClassCard(StatesGroup):
 
 class EditClassCard(StatesGroup):
     waiting_value = State()
-
-
-class CreateClan(StatesGroup):
-    waiting_photo = State()
 
 
 # ── Клавиатуры ───────────────────────────────────────────────────────────
@@ -1643,10 +1650,12 @@ _pending_clan_delete: dict[int, float] = {}
 
 
 @router.message(Command("clancreate", ignore_case=True), GROUP_CHATS)
-async def cmd_clan_create(message: Message, command: CommandObject, state: FSMContext, pool: asyncpg.Pool):
+async def cmd_clan_create(message: Message, command: CommandObject, pool: asyncpg.Pool):
     name = (command.args or "").strip()
-    if not name:
-        await message.answer("<b>✏️ Укажи название клана: /clancreate Название</b>")
+    if not name or not message.photo:
+        await message.answer(
+            "<b>✏️ Пришли фото клана с подписью: /clancreate Название</b>"
+        )
         return
     if len(name) > CLAN_NAME_MAX_LEN:
         await message.answer(f"<b>Слишком длинное название (максимум {CLAN_NAME_MAX_LEN} символов).</b>")
@@ -1658,38 +1667,13 @@ async def cmd_clan_create(message: Message, command: CommandObject, state: FSMCo
         await message.answer("<b>Клан с таким названием уже существует.</b>")
         return
 
-    await state.update_data(clan_name=name)
-    await state.set_state(CreateClan.waiting_photo)
-    await message.answer("<b>📸 Пришли фото клана</b>")
-
-
-@router.message(CreateClan.waiting_photo, GROUP_CHATS)
-async def clan_create_photo(message: Message, state: FSMContext, pool: asyncpg.Pool):
-    if not message.photo:
-        await message.answer("<b>Пришли именно фото 🙂</b>")
-        return
-
-    data = await state.get_data()
-    name = data["clan_name"]
-
-    if await get_user_clan(pool, message.from_user.id):
-        await state.clear()
-        await message.answer("<b>Ты уже состоишь в клане.</b>")
-        return
-    if await clan_name_taken(pool, name):
-        await state.clear()
-        await message.answer("<b>Пока ты думал, название заняли. Попробуй снова: /clancreate Название</b>")
-        return
-
     money = await get_chat_money(pool, message.chat.id, message.from_user.id)
     if money < CLAN_CREATE_COST:
-        await state.clear()
         await message.answer(f"<b>💰 Не хватает монет. Нужно {CLAN_CREATE_COST}, у тебя {money}.</b>")
         return
 
     photo_id = message.photo[-1].file_id
     await create_clan(pool, name, photo_id, message.from_user.id, message.from_user.full_name, message.chat.id)
-    await state.clear()
     await message.answer_photo(
         photo_id,
         caption=f"<b>🏰 Клан «{html.escape(name)}» создан!\n\n👑 Основатель: {html.escape(message.from_user.full_name)}</b>",
@@ -1864,9 +1848,24 @@ async def cmd_clan_info(message: Message, command: CommandObject, pool: asyncpg.
 # ── Реферальная программа (1% создателю группы) ───────────────────────────
 
 @router.my_chat_member(GROUP_CHATS)
-async def on_bot_added(event: ChatMemberUpdated, bot: Bot, pool: asyncpg.Pool):
+async def on_bot_membership_change(event: ChatMemberUpdated, bot: Bot, pool: asyncpg.Pool):
     old_status = event.old_chat_member.status
     new_status = event.new_chat_member.status
+    title = event.chat.title or "группа"
+
+    if new_status in ("left", "kicked"):
+        await pool.execute("DELETE FROM bot_chats WHERE chat_id = $1", event.chat.id)
+        return
+
+    if new_status in ("member", "administrator"):
+        await pool.execute(
+            """
+            INSERT INTO bot_chats (chat_id, title) VALUES ($1, $2)
+            ON CONFLICT (chat_id) DO UPDATE SET title = EXCLUDED.title
+            """,
+            event.chat.id, title,
+        )
+
     if old_status not in ("left", "kicked") or new_status not in ("member", "administrator"):
         return
 
@@ -1875,7 +1874,6 @@ async def on_bot_added(event: ChatMemberUpdated, bot: Bot, pool: asyncpg.Pool):
         return
     owner_id, owner_name = creator
 
-    title = event.chat.title or "группа"
     is_new = await register_chat_owner(pool, event.chat.id, owner_id, owner_name, title)
     if not is_new:
         return
@@ -1888,9 +1886,6 @@ async def on_bot_added(event: ChatMemberUpdated, bot: Bot, pool: asyncpg.Pool):
 
 
 # ── Лог обновлений ───────────────────────────────────────────────────────
-
-DEPLOY_NOTIFY_CHAT = "@L1meYT"
-
 
 def get_deploy_version() -> tuple[str, str]:
     """Возвращает (version_id, описание) — по git-коммиту, либо по хешу файла, если git недоступен."""
@@ -1918,12 +1913,17 @@ async def notify_deploy(bot: Bot, pool: asyncpg.Pool) -> None:
     if await get_last_deploy_version(pool) == version_id:
         return
 
-    text = f"<b>🚀 Angry Bank обновлён и запущен</b>\n\n{details}\n🔖 <code>{version_id}</code>"
-    try:
-        await bot.send_message(DEPLOY_NOTIFY_CHAT, text)
-    except TelegramAPIError as error:
-        logging.warning("Не удалось отправить лог обновления: %s", error)
-        return
+    text = (
+        f"<b>🚀 Angry Bank обновился!\n\n"
+        f"{details}\n"
+        f"🔖 Версия <code>{version_id}</code></b>"
+    )
+    for chat_id in await get_active_chat_ids(pool):
+        try:
+            await bot.send_message(chat_id, text)
+        except TelegramAPIError as error:
+            logging.warning("Не удалось отправить лог обновления в чат %s: %s", chat_id, error)
+
     await set_last_deploy_version(pool, version_id)
 
 
