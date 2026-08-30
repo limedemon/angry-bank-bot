@@ -41,6 +41,11 @@ STEAL_FAIL_LOSS_SHARE = 0.05
 CLAN_CREATE_COST = 500
 CLAN_MAX_MEMBERS = 20
 CLAN_DELETE_CONFIRM_WINDOW = 60
+ENERGY_MAX = 100
+ENERGY_REGEN_SECONDS = 10 * 60
+BATTLE_COOLDOWN_SECONDS = 5 * 60
+BATTLE_ENERGY_MIN = 3
+BATTLE_ENERGY_MAX = 5
 CLAN_TOP_LIMIT = 10
 TOP_LIMIT = 10
 
@@ -48,10 +53,12 @@ GROUP_INTRO_TEXT = (
     "<b>🐦 Angry Копилка\n\n"
     "Раз в 20 минут можно крутануть копилку и получить силу и монеты.\n"
     f"За {CLASS_SPIN_COST} монет (раз в минуту) можно крутить класс и получить только силу.\n"
-    "Ответом «кража» или /AngrySteal на чужое сообщение можно украсть монеты (раз в 30 минут).\n\n"
+    "Ответом «кража» или /AngrySteal на чужое сообщение можно украсть монеты (раз в 30 минут).\n"
+    "На энергию (100, восстанавливается 1⚡ раз в 10 минут) можно биться с мобами — /AngryBattle.\n\n"
     "🎰 /AngryOpen — крутануть копилку\n"
     "🎓 /AngryClass — крутануть класс\n"
     "🥷 /AngrySteal — украсть монеты (в ответ на сообщение)\n"
+    "⚔️ /AngryBattle — сразиться с мобом (3-5⚡, раз в 5 минут)\n"
     "ℹ️ /AngryInfo — профиль игрока (в ответ на сообщение)\n"
     "🏆 /AngryTop — топ силы чата\n\n"
     f"🏰 /clancreate Название — создать клан ({CLAN_CREATE_COST} монет)\n"
@@ -86,6 +93,13 @@ CLASS_FIELD_PROMPTS = {
     "photo_id": "<b>📸 Пришли новое фото карточки</b>",
     "name": "<b>✏️ Введи новое название карточки</b>",
     "power": "<b>⚔️ Введи новую силу карточки (число)</b>",
+}
+
+MOB_FIELD_PROMPTS = {
+    "photo_id": "<b>📸 Пришли новое фото моба</b>",
+    "name": "<b>✏️ Введи новое название моба</b>",
+    "power": "<b>⚔️ Введи новую силу моба (число)</b>",
+    "money": "<b>💰 Введи новую награду монет за убийство (число)</b>",
 }
 
 # ── Редкость карточек ────────────────────────────────────────────────────
@@ -237,6 +251,18 @@ SCHEMA_STATEMENTS = (
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_card_bird SMALLINT",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS last_open DOUBLE PRECISION NOT NULL DEFAULT 0",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS last_class DOUBLE PRECISION NOT NULL DEFAULT 0",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS energy INTEGER NOT NULL DEFAULT 100",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS energy_updated_at DOUBLE PRECISION NOT NULL DEFAULT 0",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS last_battle DOUBLE PRECISION NOT NULL DEFAULT 0",
+    """
+    CREATE TABLE IF NOT EXISTS mobs (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        power BIGINT NOT NULL,
+        money BIGINT NOT NULL,
+        photo_id TEXT NOT NULL
+    )
+    """,
     """
     DO $$
     BEGIN
@@ -409,6 +435,42 @@ async def delete_class_card(pool: asyncpg.Pool, card_id: int) -> str | None:
     return await pool.fetchval("DELETE FROM class_cards WHERE id = $1 RETURNING name", card_id)
 
 
+MOB_FIELDS = ("name", "power", "money", "photo_id")
+
+
+async def list_mobs(pool: asyncpg.Pool) -> list[dict]:
+    rows = await pool.fetch("SELECT id, name, power, money, photo_id FROM mobs ORDER BY id")
+    return [dict(row) for row in rows]
+
+
+async def mobs_count(pool: asyncpg.Pool) -> int:
+    return await pool.fetchval("SELECT COUNT(*) FROM mobs")
+
+
+async def get_mob(pool: asyncpg.Pool, mob_id: int) -> dict | None:
+    row = await pool.fetchrow(
+        "SELECT id, name, power, money, photo_id FROM mobs WHERE id = $1", mob_id
+    )
+    return dict(row) if row else None
+
+
+async def add_mob(pool: asyncpg.Pool, name: str, power: int, money: int, photo_id: str) -> None:
+    await pool.execute(
+        "INSERT INTO mobs (name, power, money, photo_id) VALUES ($1, $2, $3, $4)",
+        name, power, money, photo_id,
+    )
+
+
+async def update_mob_field(pool: asyncpg.Pool, mob_id: int, field: str, value) -> None:
+    if field not in MOB_FIELDS:
+        raise ValueError(f"Недопустимое поле моба: {field}")
+    await pool.execute(f"UPDATE mobs SET {field} = $1 WHERE id = $2", value, mob_id)
+
+
+async def delete_mob(pool: asyncpg.Pool, mob_id: int) -> str | None:
+    return await pool.fetchval("DELETE FROM mobs WHERE id = $1 RETURNING name", mob_id)
+
+
 async def register_chat_owner(
     pool: asyncpg.Pool, chat_id: int, owner_id: int, owner_name: str, chat_title: str
 ) -> bool:
@@ -504,6 +566,21 @@ async def get_player_best_card(pool: asyncpg.Pool, user_id: int) -> dict | None:
 async def get_player_power(pool: asyncpg.Pool, user_id: int) -> int:
     power = await pool.fetchval("SELECT power FROM players WHERE user_id = $1", user_id)
     return power or 0
+
+
+def _regen_energy(energy: int, updated_at: float, now: float) -> tuple[int, float]:
+    regenerated = int((now - updated_at) // ENERGY_REGEN_SECONDS)
+    if regenerated <= 0:
+        return energy, updated_at
+    return min(ENERGY_MAX, energy + regenerated), updated_at + regenerated * ENERGY_REGEN_SECONDS
+
+
+async def get_player_energy_display(pool: asyncpg.Pool, user_id: int) -> int:
+    row = await pool.fetchrow("SELECT energy, energy_updated_at FROM players WHERE user_id = $1", user_id)
+    if not row:
+        return ENERGY_MAX
+    energy, _ = _regen_energy(row["energy"], row["energy_updated_at"], time.time())
+    return energy
 
 
 async def ensure_player_name(conn: asyncpg.Connection, user_id: int, name: str) -> None:
@@ -726,6 +803,17 @@ class EditClassCard(StatesGroup):
     waiting_value = State()
 
 
+class AddMob(StatesGroup):
+    photo = State()
+    name = State()
+    power = State()
+    money = State()
+
+
+class EditMob(StatesGroup):
+    waiting_value = State()
+
+
 # ── Клавиатуры ───────────────────────────────────────────────────────────
 
 def admin_menu_text() -> str:
@@ -736,6 +824,7 @@ def admin_menu_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="🐷 Копилка", callback_data="piggy:menu")
     kb.button(text="🎓 Класс", callback_data="class:menu")
+    kb.button(text="🐗 Мобы", callback_data="mob:menu")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -810,10 +899,46 @@ def class_edit_fields_kb(card_id: int):
     return kb.as_markup()
 
 
+def mob_menu_text(mobs_total: int) -> str:
+    return f"<b>🐗 Мобы\n\nМобов: {mobs_total}</b>"
+
+
+def mob_menu_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📋 Список мобов", callback_data="mob:list")
+    kb.button(text="➕ Добавить моба", callback_data="mob:add")
+    kb.button(text="✏️ Изменить моба", callback_data="mob:edit")
+    kb.button(text="🗑 Удалить моба", callback_data="mob:remove")
+    kb.button(text="⬅️ Назад", callback_data="admin:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def mob_edit_fields_kb(mob_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📸 Фото", callback_data=f"mob:editfield:{mob_id}:photo_id")
+    kb.button(text="✏️ Название", callback_data=f"mob:editfield:{mob_id}:name")
+    kb.button(text="⚔️ Сила", callback_data=f"mob:editfield:{mob_id}:power")
+    kb.button(text="💰 Награда", callback_data=f"mob:editfield:{mob_id}:money")
+    kb.button(text="⬅️ Назад", callback_data="mob:edit")
+    kb.adjust(2, 2, 1)
+    return kb.as_markup()
+
+
+def mob_caption(mob: dict, prefix: str) -> str:
+    return (
+        f"<b>{prefix}\n\n"
+        f"🐗 {html.escape(mob['name'])}\n"
+        f"⚔️ Сила: {mob['power']}\n"
+        f"💰 Награда за убийство: {mob['money']}</b>"
+    )
+
+
 def group_menu_kb():
     kb = InlineKeyboardBuilder()
     kb.button(text="🎰 Открыть копилку", callback_data="group:open")
     kb.button(text="🎓 Крутить класс", callback_data="group:class")
+    kb.button(text="⚔️ Сразиться с мобом", callback_data="group:battle")
     kb.button(text="🏆 Топ силы", callback_data="group:top")
     kb.adjust(1)
     return kb.as_markup()
@@ -1030,6 +1155,72 @@ async def perform_steal(pool: asyncpg.Pool, chat_id: int, thief, target) -> str:
                 f"{thief_mention} попался, пытаясь обокрасть {target_mention}\n"
                 f"💰 Потеряно: {loss}</b>"
             )
+
+
+async def perform_battle(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | None, str]:
+    now = time.time()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await ensure_player_name(conn, user.id, user.full_name)
+            row = await conn.fetchrow(
+                "SELECT power, energy, energy_updated_at, last_battle FROM players WHERE user_id = $1 FOR UPDATE",
+                user.id,
+            )
+
+            remaining = BATTLE_COOLDOWN_SECONDS - (now - row["last_battle"])
+            if remaining > 0:
+                minutes, seconds = divmod(int(remaining), 60)
+                return None, f"<b>⏳ Бой ещё не готов. Попробуй через {minutes} мин {seconds} сек.</b>"
+
+            mob = await conn.fetchrow("SELECT name, power, money, photo_id FROM mobs ORDER BY random() LIMIT 1")
+            if mob is None:
+                return None, "<b>🐗 Мобы ещё не добавлены — админ пока не заселил арену.</b>"
+
+            energy, energy_updated_at = _regen_energy(row["energy"], row["energy_updated_at"], now)
+            cost = random.randint(BATTLE_ENERGY_MIN, BATTLE_ENERGY_MAX)
+            if energy < cost:
+                return None, (
+                    f"<b>🔋 Не хватает энергии. Нужно {cost}, у тебя {energy}/{ENERGY_MAX}.\n"
+                    "Восстанавливается 1⚡ раз в 10 минут.</b>"
+                )
+            energy -= cost
+
+            player_power = row["power"]
+            mob_power = mob["power"]
+            win_chance = 1.0 if player_power >= mob_power else player_power / mob_power
+            won = random.random() < win_chance
+
+            await conn.execute(
+                "UPDATE players SET energy = $2, energy_updated_at = $3, last_battle = $4 WHERE user_id = $1",
+                user.id, energy, energy_updated_at, now,
+            )
+
+            if won:
+                await conn.execute(
+                    """
+                    INSERT INTO chat_profiles (chat_id, user_id, name, money, opens)
+                    VALUES ($1, $2, $3, $4, 0)
+                    ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                        name = EXCLUDED.name,
+                        money = chat_profiles.money + EXCLUDED.money
+                    """,
+                    chat_id, user.id, user.full_name, mob["money"],
+                )
+
+    mention = f"<a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a>"
+    mob_name = html.escape(mob["name"])
+    if won:
+        caption = (
+            f"<b>⚔️ {mention} сразился с «{mob_name}» и одержал победу!\n\n"
+            f"💰 Награда: {mob['money']} монет\n"
+            f"🔋 Потрачено энергии: {cost} (осталось {energy}/{ENERGY_MAX})</b>"
+        )
+    else:
+        caption = (
+            f"<b>💀 {mention} сразился с «{mob_name}» и проиграл...\n\n"
+            f"🔋 Потрачено энергии: {cost} (осталось {energy}/{ENERGY_MAX})</b>"
+        )
+    return mob["photo_id"], caption
 
 
 async def perform_top(pool: asyncpg.Pool, chat_id: int) -> str:
@@ -1593,16 +1784,202 @@ async def class_remove_pick(callback: CallbackQuery, pool: asyncpg.Pool):
 
     cards = await list_class_cards(pool)
     if cards:
-        await safe_edit_text(callback.message, 
+        await safe_edit_text(callback.message,
             "<b>🗑 Выбери карточку для удаления:</b>", reply_markup=cards_pick_kb(cards, "remove", "class")
         )
     else:
         await safe_edit_text(callback.message, class_menu_text(0), reply_markup=class_menu_kb())
 
 
+# — Мобы (для /angrybattle) —
+
+@router.callback_query(F.data == "mob:menu", IsAdminPrivate())
+async def mob_menu_cb(callback: CallbackQuery, pool: asyncpg.Pool):
+    total = await mobs_count(pool)
+    await safe_edit_text(callback.message, mob_menu_text(total), reply_markup=mob_menu_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "mob:cancel", IsAdminPrivate())
+async def mob_cancel(callback: CallbackQuery, state: FSMContext, pool: asyncpg.Pool):
+    await state.clear()
+    total = await mobs_count(pool)
+    await safe_edit_text(callback.message, mob_menu_text(total), reply_markup=mob_menu_kb())
+    await callback.answer("Отменено")
+
+
+@router.callback_query(F.data == "mob:list", IsAdminPrivate())
+async def mob_list_cb(callback: CallbackQuery, pool: asyncpg.Pool):
+    mobs = await list_mobs(pool)
+    if not mobs:
+        await callback.answer("Мобов пока нет", show_alert=True)
+        return
+    lines = ["<b>📋 Список мобов</b>", ""]
+    for i, mob in enumerate(mobs, start=1):
+        lines.append(
+            f"<b>{i}. {html.escape(mob['name'])}</b>\n"
+            f"<b>    ⚔️{mob['power']} · 💰{mob['money']}</b>"
+        )
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ Назад", callback_data="mob:menu")
+    await safe_edit_text(callback.message, "\n".join(lines), reply_markup=kb.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "mob:add", IsAdminPrivate())
+async def mob_add_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AddMob.photo)
+    await safe_edit_text(callback.message, "<b>📸 Пришли фото моба</b>", reply_markup=cancel_kb("mob:cancel"))
+    await callback.answer()
+
+
+@router.message(AddMob.photo, IsAdminPrivate())
+async def mob_add_photo(message: Message, state: FSMContext):
+    if not message.photo:
+        await message.answer("<b>Пришли именно фото 🙂</b>")
+        return
+    await state.update_data(photo_id=message.photo[-1].file_id)
+    await state.set_state(AddMob.name)
+    await message.answer("<b>✏️ Введи название моба</b>", reply_markup=cancel_kb("mob:cancel"))
+
+
+@router.message(AddMob.name, IsAdminPrivate())
+async def mob_add_name(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("<b>Название не может быть пустым, попробуй ещё раз.</b>")
+        return
+    await state.update_data(name=name)
+    await state.set_state(AddMob.power)
+    await message.answer("<b>⚔️ Введи силу моба (число)</b>", reply_markup=cancel_kb("mob:cancel"))
+
+
+@router.message(AddMob.power, IsAdminPrivate())
+async def mob_add_power(message: Message, state: FSMContext):
+    try:
+        power = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("<b>Нужно целое число, попробуй ещё раз.</b>")
+        return
+    await state.update_data(power=power)
+    await state.set_state(AddMob.money)
+    await message.answer("<b>💰 Введи награду монет за убийство (число)</b>", reply_markup=cancel_kb("mob:cancel"))
+
+
+@router.message(AddMob.money, IsAdminPrivate())
+async def mob_add_money(message: Message, state: FSMContext, pool: asyncpg.Pool):
+    try:
+        money = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("<b>Нужно целое число, попробуй ещё раз.</b>")
+        return
+
+    data = await state.get_data()
+    await add_mob(pool, data["name"], data["power"], money, data["photo_id"])
+    await state.clear()
+
+    mob = {"name": data["name"], "power": data["power"], "money": money}
+    await message.answer_photo(data["photo_id"], caption=mob_caption(mob, "✅ Моб добавлен!"))
+    total = await mobs_count(pool)
+    await message.answer(mob_menu_text(total), reply_markup=mob_menu_kb())
+
+
+@router.callback_query(F.data == "mob:edit", IsAdminPrivate())
+async def mob_edit_list(callback: CallbackQuery, pool: asyncpg.Pool):
+    mobs = await list_mobs(pool)
+    if not mobs:
+        await callback.answer("Мобов пока нет", show_alert=True)
+        return
+    await safe_edit_text(
+        callback.message, "<b>✏️ Выбери моба для изменения:</b>", reply_markup=cards_pick_kb(mobs, "edit", "mob")
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mob:edit:"), IsAdminPrivate())
+async def mob_edit_pick(callback: CallbackQuery, pool: asyncpg.Pool):
+    mob_id = int(callback.data.split(":")[2])
+    mob = await get_mob(pool, mob_id)
+    if not mob:
+        await callback.answer("Моб не найден", show_alert=True)
+        return
+    await safe_edit_text(callback.message, mob_caption(mob, "Что изменить?"), reply_markup=mob_edit_fields_kb(mob_id))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mob:editfield:"), IsAdminPrivate())
+async def mob_editfield_start(callback: CallbackQuery, state: FSMContext):
+    _, _, mob_id, field = callback.data.split(":")
+    await state.set_state(EditMob.waiting_value)
+    await state.update_data(mob_id=int(mob_id), field=field)
+    await safe_edit_text(callback.message, MOB_FIELD_PROMPTS[field], reply_markup=cancel_kb("mob:cancel"))
+    await callback.answer()
+
+
+@router.message(EditMob.waiting_value, IsAdminPrivate())
+async def mob_editfield_value(message: Message, state: FSMContext, pool: asyncpg.Pool):
+    data = await state.get_data()
+    field = data["field"]
+    mob_id = data["mob_id"]
+
+    if field == "photo_id":
+        if not message.photo:
+            await message.answer("<b>Пришли именно фото 🙂</b>")
+            return
+        value = message.photo[-1].file_id
+    elif field in ("power", "money"):
+        try:
+            value = int((message.text or "").strip())
+        except ValueError:
+            await message.answer("<b>Нужно целое число, попробуй ещё раз.</b>")
+            return
+    else:
+        value = (message.text or "").strip()
+        if not value:
+            await message.answer("<b>Название не может быть пустым, попробуй ещё раз.</b>")
+            return
+
+    await update_mob_field(pool, mob_id, field, value)
+    await state.clear()
+
+    mob = await get_mob(pool, mob_id)
+    await message.answer_photo(
+        mob["photo_id"],
+        caption=mob_caption(mob, "✅ Моб обновлён!"),
+        reply_markup=mob_edit_fields_kb(mob_id),
+    )
+
+
+@router.callback_query(F.data == "mob:remove", IsAdminPrivate())
+async def mob_remove_list(callback: CallbackQuery, pool: asyncpg.Pool):
+    mobs = await list_mobs(pool)
+    if not mobs:
+        await callback.answer("Мобов пока нет", show_alert=True)
+        return
+    await safe_edit_text(
+        callback.message, "<b>🗑 Выбери моба для удаления:</b>", reply_markup=cards_pick_kb(mobs, "remove", "mob")
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("mob:remove:"), IsAdminPrivate())
+async def mob_remove_pick(callback: CallbackQuery, pool: asyncpg.Pool):
+    mob_id = int(callback.data.split(":")[2])
+    name = await delete_mob(pool, mob_id)
+    await callback.answer(f"Удалено: {name}" if name else "Уже удалено")
+
+    mobs = await list_mobs(pool)
+    if mobs:
+        await safe_edit_text(
+            callback.message, "<b>🗑 Выбери моба для удаления:</b>", reply_markup=cards_pick_kb(mobs, "remove", "mob")
+        )
+    else:
+        await safe_edit_text(callback.message, mob_menu_text(0), reply_markup=mob_menu_kb())
+
+
 # — Профиль игрока —
 
-def profile_text(user, summary: dict) -> str:
+def profile_text(user, summary: dict, energy: int) -> str:
     if summary["chats"] == 0:
         return (
             "<b>👤 Профиль\n\n"
@@ -1615,6 +1992,7 @@ def profile_text(user, summary: dict) -> str:
         "",
         f"⚔️ Сила (всего): {summary['power']}",
         f"💰 Монет (всего): {summary['money']}",
+        f"🔋 Энергия: {energy}/{ENERGY_MAX}",
         f"🎰 Круток копилки: {summary['opens']}",
         f"👥 Групп с игрой: {summary['chats']}",
     ]
@@ -1624,7 +2002,8 @@ def profile_text(user, summary: dict) -> str:
 @router.message(F.chat.type == "private")
 async def show_profile(message: Message, pool: asyncpg.Pool):
     summary = await get_player_summary(pool, message.from_user.id)
-    await message.answer(profile_text(message.from_user, summary))
+    energy = await get_player_energy_display(pool, message.from_user.id)
+    await message.answer(profile_text(message.from_user, summary, energy))
 
 
 # ── Групповые команды ─────────────────────────────────────────────────────
@@ -1649,6 +2028,15 @@ async def cmd_angry_open(message: Message, bot: Bot, pool: asyncpg.Pool):
 @router.message(Command("angryclass", ignore_case=True), GROUP_CHATS)
 async def cmd_angry_class(message: Message, bot: Bot, pool: asyncpg.Pool):
     photo_id, text = await perform_class(pool, message.chat.id, message.from_user)
+    if photo_id:
+        await bot.send_photo(message.chat.id, photo_id, caption=text)
+    else:
+        await message.answer(text)
+
+
+@router.message(Command("angrybattle", ignore_case=True), GROUP_CHATS)
+async def cmd_angry_battle(message: Message, bot: Bot, pool: asyncpg.Pool):
+    photo_id, text = await perform_battle(pool, message.chat.id, message.from_user)
     if photo_id:
         await bot.send_photo(message.chat.id, photo_id, caption=text)
     else:
@@ -1748,6 +2136,16 @@ async def cb_group_open(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
 @router.callback_query(F.data == "group:class", GROUP_CHATS)
 async def cb_group_class(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
     photo_id, text = await perform_class(pool, callback.message.chat.id, callback.from_user)
+    if photo_id:
+        await bot.send_photo(callback.message.chat.id, photo_id, caption=text)
+    else:
+        await callback.message.answer(text)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "group:battle", GROUP_CHATS)
+async def cb_group_battle(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
+    photo_id, text = await perform_battle(pool, callback.message.chat.id, callback.from_user)
     if photo_id:
         await bot.send_photo(callback.message.chat.id, photo_id, caption=text)
     else:
@@ -2097,6 +2495,7 @@ async def set_bot_commands(bot: Bot) -> None:
             BotCommand(command="clantop", description="топ кланов по силе"),
             BotCommand(command="clan", description="инфо о клане"),
             BotCommand(command="angryinfo", description="профиль игрока (в ответ на сообщение)"),
+            BotCommand(command="angrybattle", description="сразиться с мобом"),
             BotCommand(command="angrytop", description="открыть лидерборд"),
         ],
         scope=BotCommandScopeAllGroupChats(),
