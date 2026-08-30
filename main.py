@@ -48,10 +48,10 @@ GROUP_INTRO_TEXT = (
     "<b>🐦 Angry Копилка\n\n"
     "Раз в 20 минут можно крутануть копилку и получить силу и монеты.\n"
     f"За {CLASS_SPIN_COST} монет (раз в минуту) можно крутить класс и получить только силу.\n"
-    "Ответом «кража» или /steal на чужое сообщение можно украсть монеты (раз в 30 минут).\n\n"
+    "Ответом «кража» или /AngrySteal на чужое сообщение можно украсть монеты (раз в 30 минут).\n\n"
     "🎰 /AngryOpen — крутануть копилку\n"
     "🎓 /AngryClass — крутануть класс\n"
-    "🥷 /steal — украсть монеты (в ответ на сообщение)\n"
+    "🥷 /AngrySteal — украсть монеты (в ответ на сообщение)\n"
     "🏆 /AngryTop — топ силы чата\n\n"
     f"🏰 /clancreate Название — создать клан ({CLAN_CREATE_COST} монет)\n"
     "📨 /claninvite — пригласить в клан (в ответ на сообщение)\n"
@@ -1600,7 +1600,7 @@ async def handle_steal(message: Message, pool: asyncpg.Pool) -> None:
     await message.answer(await perform_steal(pool, message.chat.id, message.from_user, target))
 
 
-@router.message(Command("steal", ignore_case=True), GROUP_CHATS)
+@router.message(Command("angrysteal", ignore_case=True), GROUP_CHATS)
 async def cmd_steal(message: Message, pool: asyncpg.Pool):
     await handle_steal(message, pool)
 
@@ -1938,7 +1938,7 @@ async def set_bot_commands(bot: Bot) -> None:
         [
             BotCommand(command="angryopen", description="крутануть копилку"),
             BotCommand(command="angryclass", description="крутануть класс"),
-            BotCommand(command="steal", description="украсть монеты (в ответ на сообщение)"),
+            BotCommand(command="angrysteal", description="украсть монеты (в ответ на сообщение)"),
             BotCommand(command="clancreate", description="создать клан (500 монет)"),
             BotCommand(command="claninvite", description="пригласить в клан (в ответ на сообщение)"),
             BotCommand(command="clandelete", description="удалить клан (дважды подряд)"),
