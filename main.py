@@ -10,7 +10,7 @@ from aiogram import Bot, BaseMiddleware, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import BaseFilter, Command, CommandStart
+from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -35,6 +35,10 @@ STEAL_OUTCOME_WEIGHTS = (("success", 20), ("partial", 50), ("fail", 30))
 STEAL_SUCCESS_SHARE = 0.10
 STEAL_PARTIAL_SHARE = 0.05
 STEAL_FAIL_LOSS_SHARE = 0.05
+CLAN_CREATE_COST = 500
+CLAN_MAX_MEMBERS = 20
+CLAN_DELETE_CONFIRM_WINDOW = 60
+CLAN_TOP_LIMIT = 10
 TOP_LIMIT = 10
 
 GROUP_INTRO_TEXT = (
@@ -45,7 +49,13 @@ GROUP_INTRO_TEXT = (
     "🎰 /AngryOpen — крутануть копилку\n"
     "🎓 /AngryClass — крутануть класс\n"
     "🥷 /steal — украсть монеты (в ответ на сообщение)\n"
-    "🏆 /AngryTop — топ силы чата</b>"
+    "🏆 /AngryTop — топ силы чата\n\n"
+    f"🏰 /clancreate Название — создать клан ({CLAN_CREATE_COST} монет)\n"
+    "📨 /claninvite — пригласить в клан (в ответ на сообщение)\n"
+    "🚪 /clanleft — выйти из клана\n"
+    "💥 /clandelete — удалить клан (дважды подряд)\n"
+    "🏆 /clantop — топ кланов по силе\n"
+    "ℹ️ /clan [название] — инфо о клане</b>"
 )
 NON_ADMIN_PRIVATE_TEXT = (
     "<b>🐦 Привет! Я работаю в группах.\n\n"
@@ -195,9 +205,11 @@ SCHEMA_STATEMENTS = (
     """
     CREATE TABLE IF NOT EXISTS players (
         user_id BIGINT PRIMARY KEY,
+        name TEXT NOT NULL DEFAULT '',
         power BIGINT NOT NULL DEFAULT 0
     )
     """,
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT ''",
     """
     DO $$
     BEGIN
@@ -223,6 +235,22 @@ SCHEMA_STATEMENTS = (
     """,
     "ALTER TABLE chat_owners ADD COLUMN IF NOT EXISTS owner_name TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE chat_owners DROP COLUMN IF EXISTS earned",
+    """
+    CREATE TABLE IF NOT EXISTS clans (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        photo_id TEXT NOT NULL,
+        creator_id BIGINT NOT NULL,
+        created_at DOUBLE PRECISION NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS clan_members (
+        user_id BIGINT PRIMARY KEY,
+        clan_id INTEGER NOT NULL REFERENCES clans(id) ON DELETE CASCADE,
+        joined_at DOUBLE PRECISION NOT NULL
+    )
+    """,
 )
 
 
@@ -356,13 +384,23 @@ async def get_player_summary(pool: asyncpg.Pool, user_id: int) -> dict:
     return dict(row)
 
 
-async def add_player_power(conn: asyncpg.Connection, user_id: int, power: int) -> None:
+async def add_player_power(conn: asyncpg.Connection, user_id: int, name: str, power: int) -> None:
     await conn.execute(
         """
-        INSERT INTO players (user_id, power) VALUES ($1, $2)
-        ON CONFLICT (user_id) DO UPDATE SET power = players.power + EXCLUDED.power
+        INSERT INTO players (user_id, name, power) VALUES ($1, $2, $3)
+        ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name, power = players.power + EXCLUDED.power
         """,
-        user_id, power,
+        user_id, name, power,
+    )
+
+
+async def ensure_player_name(conn: asyncpg.Connection, user_id: int, name: str) -> None:
+    await conn.execute(
+        """
+        INSERT INTO players (user_id, name, power) VALUES ($1, $2, 0)
+        ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name
+        """,
+        user_id, name,
     )
 
 
@@ -382,6 +420,124 @@ def owner_notify_text(chat_title: str) -> str:
         f"<b>🎉 Ты подключил Angry Копилку к группе «{html.escape(chat_title)}»!\n\n"
         "Теперь тебе будет начисляться 1% от всех монет, которые заработают игроки в этой группе.</b>"
     )
+
+
+# ── Кланы ────────────────────────────────────────────────────────────────
+
+async def get_user_clan(pool: asyncpg.Pool, user_id: int) -> dict | None:
+    row = await pool.fetchrow(
+        """
+        SELECT c.id, c.name, c.photo_id, c.creator_id
+        FROM clan_members cm
+        JOIN clans c ON c.id = cm.clan_id
+        WHERE cm.user_id = $1
+        """,
+        user_id,
+    )
+    return dict(row) if row else None
+
+
+async def get_clan(pool: asyncpg.Pool, clan_id: int) -> dict | None:
+    row = await pool.fetchrow(
+        "SELECT id, name, photo_id, creator_id FROM clans WHERE id = $1", clan_id
+    )
+    return dict(row) if row else None
+
+
+async def get_clan_by_name(pool: asyncpg.Pool, name: str) -> dict | None:
+    # SQL lower() не приводит кириллицу в нижний регистр на серверах с локалью C,
+    # поэтому сравниваем регистронезависимо на стороне Python.
+    rows = await pool.fetch("SELECT id, name, photo_id, creator_id FROM clans")
+    target = name.strip().lower()
+    for row in rows:
+        if row["name"].lower() == target:
+            return dict(row)
+    return None
+
+
+async def clan_name_taken(pool: asyncpg.Pool, name: str) -> bool:
+    return await get_clan_by_name(pool, name) is not None
+
+
+async def get_chat_money(pool: asyncpg.Pool, chat_id: int, user_id: int) -> int:
+    money = await pool.fetchval(
+        "SELECT money FROM chat_profiles WHERE chat_id = $1 AND user_id = $2", chat_id, user_id
+    )
+    return money or 0
+
+
+async def clan_member_count(pool: asyncpg.Pool, clan_id: int) -> int:
+    return await pool.fetchval("SELECT COUNT(*) FROM clan_members WHERE clan_id = $1", clan_id)
+
+
+async def create_clan(
+    pool: asyncpg.Pool, name: str, photo_id: str, creator_id: int, creator_name: str, chat_id: int
+) -> int:
+    now = time.time()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE chat_profiles SET money = money - $1 WHERE chat_id = $2 AND user_id = $3",
+                CLAN_CREATE_COST, chat_id, creator_id,
+            )
+            await ensure_player_name(conn, creator_id, creator_name)
+            clan_id = await conn.fetchval(
+                "INSERT INTO clans (name, photo_id, creator_id, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
+                name, photo_id, creator_id, now,
+            )
+            await conn.execute(
+                "INSERT INTO clan_members (user_id, clan_id, joined_at) VALUES ($1, $2, $3)",
+                creator_id, clan_id, now,
+            )
+    return clan_id
+
+
+async def add_clan_member(pool: asyncpg.Pool, clan_id: int, user_id: int, user_name: str) -> None:
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await ensure_player_name(conn, user_id, user_name)
+            await conn.execute(
+                "INSERT INTO clan_members (user_id, clan_id, joined_at) VALUES ($1, $2, $3)",
+                user_id, clan_id, time.time(),
+            )
+
+
+async def remove_clan_member(pool: asyncpg.Pool, user_id: int) -> None:
+    await pool.execute("DELETE FROM clan_members WHERE user_id = $1", user_id)
+
+
+async def delete_clan(pool: asyncpg.Pool, clan_id: int) -> None:
+    await pool.execute("DELETE FROM clans WHERE id = $1", clan_id)
+
+
+async def get_clan_members(pool: asyncpg.Pool, clan_id: int) -> list[dict]:
+    rows = await pool.fetch(
+        """
+        SELECT cm.user_id, COALESCE(p.name, '') AS name, COALESCE(p.power, 0) AS power
+        FROM clan_members cm
+        LEFT JOIN players p ON p.user_id = cm.user_id
+        WHERE cm.clan_id = $1
+        ORDER BY power DESC
+        """,
+        clan_id,
+    )
+    return [dict(row) for row in rows]
+
+
+async def get_clan_top(pool: asyncpg.Pool, limit: int) -> list[dict]:
+    rows = await pool.fetch(
+        """
+        SELECT c.name, COUNT(cm.user_id) AS members, COALESCE(SUM(p.power), 0) AS total_power
+        FROM clans c
+        LEFT JOIN clan_members cm ON cm.clan_id = c.id
+        LEFT JOIN players p ON p.user_id = cm.user_id
+        GROUP BY c.id
+        ORDER BY total_power DESC
+        LIMIT $1
+        """,
+        limit,
+    )
+    return [dict(row) for row in rows]
 
 
 # ── Админ ────────────────────────────────────────────────────────────────
@@ -444,6 +600,10 @@ class AddClassCard(StatesGroup):
 
 class EditClassCard(StatesGroup):
     waiting_value = State()
+
+
+class CreateClan(StatesGroup):
+    waiting_photo = State()
 
 
 # ── Клавиатуры ───────────────────────────────────────────────────────────
@@ -592,7 +752,7 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
                 """,
                 chat_id, user.id, user.full_name, card["money"], now,
             )
-            await add_player_power(conn, user.id, card["power"])
+            await add_player_power(conn, user.id, user.full_name, card["power"])
 
             # Реферальные 1% владельцу группы — прибавляются прямо к его основным
             # деньгам (не отдельным счётчиком), молча, без уведомлений.
@@ -656,7 +816,7 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | N
                 """,
                 chat_id, user.id, user.full_name, -CLASS_SPIN_COST, now,
             )
-            await add_player_power(conn, user.id, card["power"])
+            await add_player_power(conn, user.id, user.full_name, card["power"])
 
     caption = (
         f"<b>🎓 <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> крутит класс!\n\n"
@@ -1421,6 +1581,231 @@ async def cb_group_top(callback: CallbackQuery, pool: asyncpg.Pool):
     await callback.answer()
 
 
+# ── Кланы ─────────────────────────────────────────────────────────────────
+
+CLAN_NAME_MAX_LEN = 40
+_pending_clan_delete: dict[int, float] = {}
+
+
+@router.message(Command("clancreate", ignore_case=True), GROUP_CHATS)
+async def cmd_clan_create(message: Message, command: CommandObject, state: FSMContext, pool: asyncpg.Pool):
+    name = (command.args or "").strip()
+    if not name:
+        await message.answer("<b>✏️ Укажи название клана: /clancreate Название</b>")
+        return
+    if len(name) > CLAN_NAME_MAX_LEN:
+        await message.answer(f"<b>Слишком длинное название (максимум {CLAN_NAME_MAX_LEN} символов).</b>")
+        return
+    if await get_user_clan(pool, message.from_user.id):
+        await message.answer("<b>Ты уже состоишь в клане.</b>")
+        return
+    if await clan_name_taken(pool, name):
+        await message.answer("<b>Клан с таким названием уже существует.</b>")
+        return
+
+    await state.update_data(clan_name=name)
+    await state.set_state(CreateClan.waiting_photo)
+    await message.answer("<b>📸 Пришли фото клана</b>")
+
+
+@router.message(CreateClan.waiting_photo, GROUP_CHATS)
+async def clan_create_photo(message: Message, state: FSMContext, pool: asyncpg.Pool):
+    if not message.photo:
+        await message.answer("<b>Пришли именно фото 🙂</b>")
+        return
+
+    data = await state.get_data()
+    name = data["clan_name"]
+
+    if await get_user_clan(pool, message.from_user.id):
+        await state.clear()
+        await message.answer("<b>Ты уже состоишь в клане.</b>")
+        return
+    if await clan_name_taken(pool, name):
+        await state.clear()
+        await message.answer("<b>Пока ты думал, название заняли. Попробуй снова: /clancreate Название</b>")
+        return
+
+    money = await get_chat_money(pool, message.chat.id, message.from_user.id)
+    if money < CLAN_CREATE_COST:
+        await state.clear()
+        await message.answer(f"<b>💰 Не хватает монет. Нужно {CLAN_CREATE_COST}, у тебя {money}.</b>")
+        return
+
+    photo_id = message.photo[-1].file_id
+    await create_clan(pool, name, photo_id, message.from_user.id, message.from_user.full_name, message.chat.id)
+    await state.clear()
+    await message.answer_photo(
+        photo_id,
+        caption=f"<b>🏰 Клан «{html.escape(name)}» создан!\n\n👑 Основатель: {html.escape(message.from_user.full_name)}</b>",
+    )
+
+
+@router.message(Command("claninvite", ignore_case=True), GROUP_CHATS)
+async def cmd_clan_invite(message: Message, pool: asyncpg.Pool):
+    clan = await get_user_clan(pool, message.from_user.id)
+    if not clan:
+        await message.answer("<b>У тебя нет клана.</b>")
+        return
+    if clan["creator_id"] != message.from_user.id:
+        await message.answer("<b>Приглашать в клан может только его создатель.</b>")
+        return
+
+    reply = message.reply_to_message
+    if reply is None or reply.from_user is None:
+        await message.answer("<b>Ответь этой командой на сообщение игрока, которого хочешь пригласить.</b>")
+        return
+    target = reply.from_user
+    if target.is_bot:
+        await message.answer("<b>Ботов приглашать нельзя.</b>")
+        return
+    if target.id == message.from_user.id:
+        await message.answer("<b>Нельзя пригласить самого себя.</b>")
+        return
+    if await get_user_clan(pool, target.id):
+        await message.answer("<b>Этот игрок уже состоит в клане.</b>")
+        return
+    if await clan_member_count(pool, clan["id"]) >= CLAN_MAX_MEMBERS:
+        await message.answer(f"<b>В клане уже максимум участников ({CLAN_MAX_MEMBERS}).</b>")
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Принять", callback_data=f"clan:accept:{clan['id']}:{target.id}")
+    kb.button(text="❌ Отклонить", callback_data=f"clan:decline:{clan['id']}:{target.id}")
+    kb.adjust(2)
+    await message.answer(
+        f"<b>📨 {html.escape(target.full_name)}, тебя приглашают в клан «{html.escape(clan['name'])}»!</b>",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.callback_query(F.data.startswith("clan:accept:"), GROUP_CHATS)
+async def clan_invite_accept(callback: CallbackQuery, pool: asyncpg.Pool):
+    _, _, clan_id_str, user_id_str = callback.data.split(":")
+    clan_id, invited_id = int(clan_id_str), int(user_id_str)
+    if callback.from_user.id != invited_id:
+        await callback.answer("Это приглашение не тебе", show_alert=True)
+        return
+    if await get_user_clan(pool, invited_id):
+        await callback.answer("Ты уже в клане", show_alert=True)
+        await safe_edit_text(callback.message, "<b>Приглашение больше не активно.</b>")
+        return
+    clan = await get_clan(pool, clan_id)
+    if not clan:
+        await callback.answer("Этот клан уже не существует", show_alert=True)
+        await safe_edit_text(callback.message, "<b>Этот клан больше не существует.</b>")
+        return
+    if await clan_member_count(pool, clan_id) >= CLAN_MAX_MEMBERS:
+        await callback.answer("В клане уже нет мест", show_alert=True)
+        await safe_edit_text(callback.message, "<b>В клане уже нет свободных мест.</b>")
+        return
+
+    await add_clan_member(pool, clan_id, invited_id, callback.from_user.full_name)
+    await safe_edit_text(
+        callback.message,
+        f"<b>🎉 {html.escape(callback.from_user.full_name)} вступил в клан «{html.escape(clan['name'])}»!</b>",
+    )
+    await callback.answer("Добро пожаловать в клан!")
+
+
+@router.callback_query(F.data.startswith("clan:decline:"), GROUP_CHATS)
+async def clan_invite_decline(callback: CallbackQuery):
+    _, _, _clan_id_str, user_id_str = callback.data.split(":")
+    if callback.from_user.id != int(user_id_str):
+        await callback.answer("Это приглашение не тебе", show_alert=True)
+        return
+    await safe_edit_text(callback.message, "<b>Приглашение отклонено.</b>")
+    await callback.answer()
+
+
+@router.message(Command("clandelete", ignore_case=True), GROUP_CHATS)
+async def cmd_clan_delete(message: Message, pool: asyncpg.Pool):
+    clan = await get_user_clan(pool, message.from_user.id)
+    if not clan:
+        await message.answer("<b>У тебя нет клана.</b>")
+        return
+    if clan["creator_id"] != message.from_user.id:
+        await message.answer("<b>Удалить клан может только его создатель.</b>")
+        return
+
+    now = time.time()
+    last_attempt = _pending_clan_delete.get(message.from_user.id)
+    if last_attempt is not None and now - last_attempt <= CLAN_DELETE_CONFIRM_WINDOW:
+        _pending_clan_delete.pop(message.from_user.id, None)
+        await delete_clan(pool, clan["id"])
+        await message.answer(f"<b>💥 Клан «{html.escape(clan['name'])}» удалён.</b>")
+        return
+
+    _pending_clan_delete[message.from_user.id] = now
+    await message.answer(
+        f"<b>⚠️ Чтобы удалить клан «{html.escape(clan['name'])}», отправь /clandelete ещё раз в течение минуты.</b>"
+    )
+
+
+@router.message(Command("clanleft", ignore_case=True), GROUP_CHATS)
+async def cmd_clan_left(message: Message, pool: asyncpg.Pool):
+    clan = await get_user_clan(pool, message.from_user.id)
+    if not clan:
+        await message.answer("<b>Ты не состоишь в клане.</b>")
+        return
+    if clan["creator_id"] == message.from_user.id:
+        await message.answer(
+            "<b>Ты создатель клана — сначала удали его через /clandelete (дважды подряд в течение минуты).</b>"
+        )
+        return
+    await remove_clan_member(pool, message.from_user.id)
+    await message.answer(f"<b>👋 Ты покинул клан «{html.escape(clan['name'])}».</b>")
+
+
+@router.message(Command("clantop", ignore_case=True), GROUP_CHATS)
+async def cmd_clan_top(message: Message, pool: asyncpg.Pool):
+    clans = await get_clan_top(pool, CLAN_TOP_LIMIT)
+    if not clans:
+        await message.answer("<b>📭 Пока нет ни одного клана.</b>")
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["<b>🏆 Топ кланов по силе", "━━━━━━━━━━━━━━", ""]
+    for i, clan in enumerate(clans):
+        prefix = medals[i] if i < len(medals) else f"{i + 1}."
+        lines.append(
+            f"{prefix} {html.escape(clan['name'])} — ⚔️ {clan['total_power']} "
+            f"({clan['members']}/{CLAN_MAX_MEMBERS})"
+        )
+    await message.answer("\n".join(lines) + "</b>")
+
+
+@router.message(Command("clan", ignore_case=True), GROUP_CHATS)
+async def cmd_clan_info(message: Message, command: CommandObject, pool: asyncpg.Pool):
+    query = (command.args or "").strip()
+    if query:
+        clan = await get_clan_by_name(pool, query)
+        if not clan:
+            await message.answer("<b>Клан с таким названием не найден.</b>")
+            return
+    else:
+        clan = await get_user_clan(pool, message.from_user.id)
+        if not clan:
+            await message.answer("<b>Ты не состоишь в клане. Чтобы посмотреть другой: /clan Название</b>")
+            return
+
+    members = await get_clan_members(pool, clan["id"])
+    total_power = sum(member["power"] for member in members)
+
+    lines = [
+        f"<b>🏰 {html.escape(clan['name'])}\n\n"
+        f"⚔️ Общая сила: {total_power}\n"
+        f"👥 Участников: {len(members)}/{CLAN_MAX_MEMBERS}\n\n"
+        "Состав:</b>"
+    ]
+    for i, member in enumerate(members, start=1):
+        crown = "👑 " if member["user_id"] == clan["creator_id"] else ""
+        name = html.escape(member["name"] or "Игрок")
+        lines.append(f"<b>{i}. {crown}{name} — ⚔️ {member['power']}</b>")
+
+    await message.answer_photo(clan["photo_id"], caption="\n".join(lines))
+
+
 # ── Реферальная программа (1% создателю группы) ───────────────────────────
 
 @router.my_chat_member(GROUP_CHATS)
@@ -1459,6 +1844,12 @@ async def set_bot_commands(bot: Bot) -> None:
             BotCommand(command="angryopen", description="крутануть копилку"),
             BotCommand(command="angryclass", description="крутануть класс"),
             BotCommand(command="steal", description="украсть монеты (в ответ на сообщение)"),
+            BotCommand(command="clancreate", description="создать клан (500 монет)"),
+            BotCommand(command="claninvite", description="пригласить в клан (в ответ на сообщение)"),
+            BotCommand(command="clandelete", description="удалить клан (дважды подряд)"),
+            BotCommand(command="clanleft", description="выйти из клана"),
+            BotCommand(command="clantop", description="топ кланов по силе"),
+            BotCommand(command="clan", description="инфо о клане"),
             BotCommand(command="angrytop", description="открыть лидерборд"),
         ],
         scope=BotCommandScopeAllGroupChats(),
