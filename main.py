@@ -52,6 +52,7 @@ GROUP_INTRO_TEXT = (
     "🎰 /AngryOpen — крутануть копилку\n"
     "🎓 /AngryClass — крутануть класс\n"
     "🥷 /AngrySteal — украсть монеты (в ответ на сообщение)\n"
+    "ℹ️ /AngryInfo — профиль игрока (в ответ на сообщение)\n"
     "🏆 /AngryTop — топ силы чата\n\n"
     f"🏰 /clancreate Название — создать клан ({CLAN_CREATE_COST} монет)\n"
     "📨 /claninvite — пригласить в клан (в ответ на сообщение)\n"
@@ -220,10 +221,20 @@ SCHEMA_STATEMENTS = (
         name TEXT NOT NULL DEFAULT '',
         power BIGINT NOT NULL DEFAULT 0,
         last_open DOUBLE PRECISION NOT NULL DEFAULT 0,
-        last_class DOUBLE PRECISION NOT NULL DEFAULT 0
+        last_class DOUBLE PRECISION NOT NULL DEFAULT 0,
+        best_card_name TEXT,
+        best_card_photo_id TEXT,
+        best_card_power BIGINT,
+        best_card_rarity SMALLINT,
+        best_card_bird SMALLINT
     )
     """,
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_card_name TEXT",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_card_photo_id TEXT",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_card_power BIGINT",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_card_rarity SMALLINT",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_card_bird SMALLINT",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS last_open DOUBLE PRECISION NOT NULL DEFAULT 0",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS last_class DOUBLE PRECISION NOT NULL DEFAULT 0",
     """
@@ -450,6 +461,49 @@ async def add_player_power(conn: asyncpg.Connection, user_id: int, name: str, po
         """,
         user_id, name, power,
     )
+
+
+async def maybe_update_best_card(conn: asyncpg.Connection, user_id: int, card: dict) -> None:
+    row = await conn.fetchrow(
+        "SELECT best_card_rarity, best_card_power FROM players WHERE user_id = $1", user_id
+    )
+    current_rarity = row["best_card_rarity"] if row else None
+    current_power = row["best_card_power"] if row else None
+    is_better = (
+        current_rarity is None
+        or card["rarity"] > current_rarity
+        or (card["rarity"] == current_rarity and card["power"] > (current_power or 0))
+    )
+    if not is_better:
+        return
+    await conn.execute(
+        """
+        UPDATE players SET
+            best_card_name = $2, best_card_photo_id = $3,
+            best_card_power = $4, best_card_rarity = $5, best_card_bird = $6
+        WHERE user_id = $1
+        """,
+        user_id, card["name"], card["photo_id"], card["power"], card["rarity"], card["bird"],
+    )
+
+
+async def get_player_best_card(pool: asyncpg.Pool, user_id: int) -> dict | None:
+    row = await pool.fetchrow(
+        """
+        SELECT best_card_name AS name, best_card_photo_id AS photo_id,
+               best_card_power AS power, best_card_rarity AS rarity, best_card_bird AS bird
+        FROM players WHERE user_id = $1
+        """,
+        user_id,
+    )
+    if not row or row["photo_id"] is None:
+        return None
+    return dict(row)
+
+
+async def get_player_power(pool: asyncpg.Pool, user_id: int) -> int:
+    power = await pool.fetchval("SELECT power FROM players WHERE user_id = $1", user_id)
+    return power or 0
 
 
 async def ensure_player_name(conn: asyncpg.Connection, user_id: int, name: str) -> None:
@@ -818,6 +872,7 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
             )
             await add_player_power(conn, user.id, user.full_name, card["power"])
             await set_player_cooldown(conn, user.id, user.full_name, "last_open", now)
+            await maybe_update_best_card(conn, user.id, dict(card))
 
             # Реферальные 1% владельцу группы — прибавляются прямо к его основным
             # деньгам (не отдельным счётчиком), молча, без уведомлений.
@@ -1605,6 +1660,54 @@ async def cmd_angry_top(message: Message, pool: asyncpg.Pool):
     await message.answer(await perform_top(pool, message.chat.id))
 
 
+@router.message(Command("angryinfo", ignore_case=True), GROUP_CHATS)
+async def cmd_angry_info(message: Message, command: CommandObject, bot: Bot, pool: asyncpg.Pool):
+    reply = message.reply_to_message
+    if reply is not None and reply.from_user is not None:
+        target = reply.from_user
+    else:
+        arg = (command.args or "").strip().lstrip("@")
+        if arg:
+            try:
+                target = await bot.get_chat(f"@{arg}")
+            except TelegramAPIError:
+                await message.answer("<b>Не нашёл такого игрока.</b>")
+                return
+        else:
+            target = message.from_user
+
+    if getattr(target, "is_bot", False):
+        await message.answer("<b>У ботов нет профиля игрока.</b>")
+        return
+
+    target_id = target.id
+    target_name = target.full_name
+
+    power = await get_player_power(pool, target_id)
+    money = await get_chat_money(pool, message.chat.id, target_id)
+    clan = await get_user_clan(pool, target_id)
+    best_card = await get_player_best_card(pool, target_id)
+
+    lines = [f"<b>👤 {html.escape(target_name)}</b>", "━━━━━━━━━━━━━━", ""]
+    if best_card:
+        lines.append(f"<b>🃏 Лучшая карточка:</b> {card_title(best_card)}")
+        lines.append(rarity_display(best_card["rarity"]))
+    else:
+        lines.append("<b>🃏 Лучшая карточка:</b> пока нет — крути /AngryOpen!")
+    lines += [
+        "",
+        f"<b>⚔️ Сила:</b> {power}",
+        f"<b>💰 Монет:</b> {money}",
+        f"<b>🏰 Клан:</b> {html.escape(clan['name']) if clan else 'нет'}",
+    ]
+    caption = "\n".join(lines)
+
+    if best_card:
+        await message.answer_photo(best_card["photo_id"], caption=caption)
+    else:
+        await message.answer(caption)
+
+
 async def handle_steal(message: Message, pool: asyncpg.Pool) -> None:
     reply = message.reply_to_message
     if reply is None or reply.from_user is None:
@@ -1993,6 +2096,7 @@ async def set_bot_commands(bot: Bot) -> None:
             BotCommand(command="clanleft", description="выйти из клана"),
             BotCommand(command="clantop", description="топ кланов по силе"),
             BotCommand(command="clan", description="инфо о клане"),
+            BotCommand(command="angryinfo", description="профиль игрока (в ответ на сообщение)"),
             BotCommand(command="angrytop", description="открыть лидерборд"),
         ],
         scope=BotCommandScopeAllGroupChats(),
