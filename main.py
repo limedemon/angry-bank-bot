@@ -30,9 +30,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 logging.basicConfig(level=logging.INFO)
 
-COOLDOWN_SECONDS = 60 * 60
-CLASS_COOLDOWN_SECONDS = 5 * 60
-CLASS_SPIN_COST = 10
+COOLDOWN_SECONDS = 20 * 60
+CLASS_COOLDOWN_SECONDS = 1 * 60
+CLASS_SPIN_COST = 30
 STEAL_COOLDOWN_SECONDS = 30 * 60
 STEAL_OUTCOME_WEIGHTS = (("success", 20), ("partial", 50), ("fail", 30))
 STEAL_SUCCESS_SHARE = 0.10
@@ -46,8 +46,8 @@ TOP_LIMIT = 10
 
 GROUP_INTRO_TEXT = (
     "<b>🐦 Angry Копилка\n\n"
-    "Раз в час можно крутануть копилку и получить силу и монеты.\n"
-    f"За {CLASS_SPIN_COST} монет (раз в 5 минут) можно крутить класс и получить только силу.\n"
+    "Раз в 20 минут можно крутануть копилку и получить силу и монеты.\n"
+    f"За {CLASS_SPIN_COST} монет (раз в минуту) можно крутить класс и получить только силу.\n"
     "Ответом «кража» или /steal на чужое сообщение можно украсть монеты (раз в 30 минут).\n\n"
     "🎰 /AngryOpen — крутануть копилку\n"
     "🎓 /AngryClass — крутануть класс\n"
@@ -205,16 +205,20 @@ SCHEMA_STATEMENTS = (
     """,
     "ALTER TABLE chat_profiles ADD COLUMN IF NOT EXISTS last_class DOUBLE PRECISION NOT NULL DEFAULT 0",
     "ALTER TABLE chat_profiles ADD COLUMN IF NOT EXISTS last_steal DOUBLE PRECISION NOT NULL DEFAULT 0",
-    # Сила — общий показатель игрока на все чаты (лидерборд при этом остаётся
-    # своим для каждого чата: он ранжирует участников чата по этой общей силе).
+    # Сила и кулдауны копилки/класса — общие показатели игрока на все чаты (лидерборд
+    # при этом остаётся своим для каждого чата: ранжирует участников чата по общей силе).
     """
     CREATE TABLE IF NOT EXISTS players (
         user_id BIGINT PRIMARY KEY,
         name TEXT NOT NULL DEFAULT '',
-        power BIGINT NOT NULL DEFAULT 0
+        power BIGINT NOT NULL DEFAULT 0,
+        last_open DOUBLE PRECISION NOT NULL DEFAULT 0,
+        last_class DOUBLE PRECISION NOT NULL DEFAULT 0
     )
     """,
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS last_open DOUBLE PRECISION NOT NULL DEFAULT 0",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS last_class DOUBLE PRECISION NOT NULL DEFAULT 0",
     """
     DO $$
     BEGIN
@@ -229,6 +233,29 @@ SCHEMA_STATEMENTS = (
     END $$;
     """,
     "ALTER TABLE chat_profiles DROP COLUMN IF EXISTS power",
+    """
+    DO $$
+    BEGIN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'chat_profiles' AND column_name = 'last_open'
+        ) THEN
+            INSERT INTO players (user_id, last_open)
+            SELECT user_id, MAX(last_open) FROM chat_profiles GROUP BY user_id
+            ON CONFLICT (user_id) DO UPDATE SET last_open = GREATEST(players.last_open, EXCLUDED.last_open);
+        END IF;
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'chat_profiles' AND column_name = 'last_class'
+        ) THEN
+            INSERT INTO players (user_id, last_class)
+            SELECT user_id, MAX(last_class) FROM chat_profiles GROUP BY user_id
+            ON CONFLICT (user_id) DO UPDATE SET last_class = GREATEST(players.last_class, EXCLUDED.last_class);
+        END IF;
+    END $$;
+    """,
+    "ALTER TABLE chat_profiles DROP COLUMN IF EXISTS last_open",
+    "ALTER TABLE chat_profiles DROP COLUMN IF EXISTS last_class",
     """
     CREATE TABLE IF NOT EXISTS chat_owners (
         chat_id BIGINT PRIMARY KEY,
@@ -414,6 +441,18 @@ async def ensure_player_name(conn: asyncpg.Connection, user_id: int, name: str) 
         ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name
         """,
         user_id, name,
+    )
+
+
+async def set_player_cooldown(conn: asyncpg.Connection, user_id: int, name: str, field: str, timestamp: float) -> None:
+    if field not in ("last_open", "last_class"):
+        raise ValueError(f"Недопустимое поле кулдауна: {field}")
+    await conn.execute(
+        f"""
+        INSERT INTO players (user_id, name, {field}) VALUES ($1, $2, $3)
+        ON CONFLICT (user_id) DO UPDATE SET {field} = EXCLUDED.{field}
+        """,
+        user_id, name, timestamp,
     )
 
 
@@ -743,11 +782,10 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
             if card is None:
                 return None, "<b>🕳 Копилка пока пуста — админ ещё не добавил карточки.</b>"
 
-            profile = await conn.fetchrow(
-                "SELECT last_open FROM chat_profiles WHERE chat_id = $1 AND user_id = $2 FOR UPDATE",
-                chat_id, user.id,
+            player_row = await conn.fetchrow(
+                "SELECT last_open FROM players WHERE user_id = $1 FOR UPDATE", user.id
             )
-            last_open = profile["last_open"] if profile else 0
+            last_open = player_row["last_open"] if player_row else 0
             remaining = COOLDOWN_SECONDS - (now - last_open)
             if remaining > 0:
                 minutes, seconds = divmod(int(remaining), 60)
@@ -755,17 +793,17 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
 
             await conn.execute(
                 """
-                INSERT INTO chat_profiles (chat_id, user_id, name, money, opens, last_open)
-                VALUES ($1, $2, $3, $4, 1, $5)
+                INSERT INTO chat_profiles (chat_id, user_id, name, money, opens)
+                VALUES ($1, $2, $3, $4, 1)
                 ON CONFLICT (chat_id, user_id) DO UPDATE SET
                     name = EXCLUDED.name,
                     money = chat_profiles.money + EXCLUDED.money,
-                    opens = chat_profiles.opens + 1,
-                    last_open = EXCLUDED.last_open
+                    opens = chat_profiles.opens + 1
                 """,
-                chat_id, user.id, user.full_name, card["money"], now,
+                chat_id, user.id, user.full_name, card["money"],
             )
             await add_player_power(conn, user.id, user.full_name, card["power"])
+            await set_player_cooldown(conn, user.id, user.full_name, "last_open", now)
 
             # Реферальные 1% владельцу группы — прибавляются прямо к его основным
             # деньгам (не отдельным счётчиком), молча, без уведомлений.
@@ -773,8 +811,8 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
             if referral_amount > 0:
                 await conn.execute(
                     """
-                    INSERT INTO chat_profiles (chat_id, user_id, name, money, opens, last_open)
-                    SELECT $2, o.owner_id, o.owner_name, $1, 0, 0
+                    INSERT INTO chat_profiles (chat_id, user_id, name, money, opens)
+                    SELECT $2, o.owner_id, o.owner_name, $1, 0
                     FROM chat_owners o
                     WHERE o.chat_id = $2
                     ON CONFLICT (chat_id, user_id) DO UPDATE SET
@@ -804,11 +842,15 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | N
                 return None, "<b>🕳 Класс пока пуст — админ ещё не добавил карточки.</b>"
 
             profile = await conn.fetchrow(
-                "SELECT money, last_class FROM chat_profiles WHERE chat_id = $1 AND user_id = $2 FOR UPDATE",
+                "SELECT money FROM chat_profiles WHERE chat_id = $1 AND user_id = $2 FOR UPDATE",
                 chat_id, user.id,
             )
             balance = profile["money"] if profile else 0
-            last_class = profile["last_class"] if profile else 0
+
+            player_row = await conn.fetchrow(
+                "SELECT last_class FROM players WHERE user_id = $1 FOR UPDATE", user.id
+            )
+            last_class = player_row["last_class"] if player_row else 0
 
             remaining = CLASS_COOLDOWN_SECONDS - (now - last_class)
             if remaining > 0:
@@ -820,16 +862,16 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | N
 
             await conn.execute(
                 """
-                INSERT INTO chat_profiles (chat_id, user_id, name, money, opens, last_open, last_class)
-                VALUES ($1, $2, $3, $4, 0, 0, $5)
+                INSERT INTO chat_profiles (chat_id, user_id, name, money, opens)
+                VALUES ($1, $2, $3, $4, 0)
                 ON CONFLICT (chat_id, user_id) DO UPDATE SET
                     name = EXCLUDED.name,
-                    money = chat_profiles.money + EXCLUDED.money,
-                    last_class = EXCLUDED.last_class
+                    money = chat_profiles.money + EXCLUDED.money
                 """,
-                chat_id, user.id, user.full_name, -CLASS_SPIN_COST, now,
+                chat_id, user.id, user.full_name, -CLASS_SPIN_COST,
             )
             await add_player_power(conn, user.id, user.full_name, card["power"])
+            await set_player_cooldown(conn, user.id, user.full_name, "last_class", now)
 
     caption = (
         f"<b>🎓 <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> крутит класс!\n\n"
@@ -867,8 +909,8 @@ async def perform_steal(pool: asyncpg.Pool, chat_id: int, thief, target) -> str:
 
             await conn.execute(
                 """
-                INSERT INTO chat_profiles (chat_id, user_id, name, money, opens, last_open, last_class, last_steal)
-                VALUES ($1, $2, $3, 0, 0, 0, 0, $4)
+                INSERT INTO chat_profiles (chat_id, user_id, name, money, opens, last_steal)
+                VALUES ($1, $2, $3, 0, 0, $4)
                 ON CONFLICT (chat_id, user_id) DO UPDATE SET
                     name = EXCLUDED.name,
                     last_steal = EXCLUDED.last_steal
