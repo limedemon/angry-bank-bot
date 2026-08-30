@@ -64,6 +64,13 @@ NON_ADMIN_PRIVATE_TEXT = (
     "<b>🐦 Привет! Я работаю в группах.\n\n"
     "Добавь меня в чат и используй там команды /AngryOpen, /AngryClass и /AngryTop.</b>"
 )
+REFERRAL_HOWTO_TEXT = (
+    "<b>💰 Как зарабатывать на своей группе\n\n"
+    "1. Добавь меня в свою группу (кнопка ниже).\n"
+    "2. Я сам определю создателя группы и начну начислять тебе 1% от всех монет, которые "
+    "заработают игроки в этой группе — прямо к твоему балансу, без лишних уведомлений.\n"
+    "3. Больше ничего делать не нужно — доход идёт автоматически, пока бот в группе.</b>"
+)
 
 CARD_FIELDS = ("name", "power", "money", "photo_id", "rarity", "bird")
 FIELD_PROMPTS = {
@@ -1009,7 +1016,15 @@ async def safe_edit_text(message: Message, text: str, reply_markup=None) -> None
 # ── Приватные сообщения (админ-панель) ───────────────────────────────────
 
 @router.message(CommandStart(), F.chat.type == "private")
-async def cmd_start_private(message: Message, state: FSMContext, pool: asyncpg.Pool):
+async def cmd_start_private(message: Message, command: CommandObject, state: FSMContext, bot: Bot, pool: asyncpg.Pool):
+    if (command.args or "") == "referral":
+        me = await bot.get_me()
+        kb = InlineKeyboardBuilder()
+        kb.button(text="➕ Добавить бота в группу", url=f"https://t.me/{me.username}?startgroup=ref")
+        kb.adjust(1)
+        await message.answer(REFERRAL_HOWTO_TEXT, reply_markup=kb.as_markup())
+        return
+
     admin_id = await get_admin_id(pool)
     if message.from_user.id == admin_id:
         await state.clear()
@@ -1927,6 +1942,39 @@ async def notify_deploy(bot: Bot, pool: asyncpg.Pool) -> None:
     await set_last_deploy_version(pool, version_id)
 
 
+# ── Промо реферальной программы ─────────────────────────────────────────
+
+REFERRAL_PROMO_INTERVAL = 3 * 60 * 60
+
+REFERRAL_PROMO_TEXT = (
+    "<b>🎁 Зарабатывай на своей группе!\n\n"
+    "Добавь Angry Копилку в свою группу — и получай 1% от всех монет, которые заработают "
+    "игроки в этой группе. Автоматически, пассивно, без каких-либо усилий.</b>"
+)
+
+
+def referral_promo_kb(bot_username: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📖 Как подключить", url=f"https://t.me/{bot_username}?start=referral")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def broadcast_referral_promo(bot: Bot, pool: asyncpg.Pool, bot_username: str) -> None:
+    kb = referral_promo_kb(bot_username)
+    for chat_id in await get_active_chat_ids(pool):
+        try:
+            await bot.send_message(chat_id, REFERRAL_PROMO_TEXT, reply_markup=kb)
+        except TelegramAPIError as error:
+            logging.warning("Не удалось отправить промо в чат %s: %s", chat_id, error)
+
+
+async def referral_promo_loop(bot: Bot, pool: asyncpg.Pool, bot_username: str) -> None:
+    while True:
+        await asyncio.sleep(REFERRAL_PROMO_INTERVAL)
+        await broadcast_referral_promo(bot, pool, bot_username)
+
+
 # ── Запуск ───────────────────────────────────────────────────────────────
 
 async def set_bot_commands(bot: Bot) -> None:
@@ -1976,6 +2024,10 @@ async def main() -> None:
         await set_bot_commands(bot)
         await bot.delete_webhook(drop_pending_updates=True)
         await notify_deploy(bot, pool)
+
+        me = await bot.get_me()
+        asyncio.create_task(referral_promo_loop(bot, pool, me.username))
+
         await dp.start_polling(bot, pool=pool)
     finally:
         await pool.close()
