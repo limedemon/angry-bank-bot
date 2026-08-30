@@ -1465,7 +1465,7 @@ async def set_bot_commands(bot: Bot) -> None:
     )
 
 
-BOT_TOKEN = "8822713742:AAH_AWB1yhYl1UY1GvwctUg5sz2RltzyeW0"
+BOT_TOKEN = "8822713742:AAHYx6SzmdiOyrESTgnrDcNoTYpxzrlP5K4"
 DATABASE_URL = (
     "postgresql://bothost_db_070b39e25784:-IpoMUbOGfL-gKUZj9kDRhD7RrJ02C7NOcrrvFBIxWo"
     "@node1.pghost.ru:16036/bothost_db_070b39e25784"
