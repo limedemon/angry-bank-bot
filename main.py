@@ -2013,39 +2013,39 @@ GROUP_CHATS = F.chat.type.in_({"group", "supergroup"})
 
 @router.message(CommandStart(), GROUP_CHATS)
 async def cmd_start_group(message: Message):
-    await message.answer(GROUP_INTRO_TEXT, reply_markup=group_menu_kb())
+    await message.reply(GROUP_INTRO_TEXT, reply_markup=group_menu_kb())
 
 
 @router.message(Command("angryopen", ignore_case=True), GROUP_CHATS)
-async def cmd_angry_open(message: Message, bot: Bot, pool: asyncpg.Pool):
+async def cmd_angry_open(message: Message, pool: asyncpg.Pool):
     photo_id, text = await perform_open(pool, message.chat.id, message.from_user)
     if photo_id:
-        await bot.send_photo(message.chat.id, photo_id, caption=text)
+        await message.reply_photo(photo_id, caption=text)
     else:
-        await message.answer(text)
+        await message.reply(text)
 
 
 @router.message(Command("angryclass", ignore_case=True), GROUP_CHATS)
-async def cmd_angry_class(message: Message, bot: Bot, pool: asyncpg.Pool):
+async def cmd_angry_class(message: Message, pool: asyncpg.Pool):
     photo_id, text = await perform_class(pool, message.chat.id, message.from_user)
     if photo_id:
-        await bot.send_photo(message.chat.id, photo_id, caption=text)
+        await message.reply_photo(photo_id, caption=text)
     else:
-        await message.answer(text)
+        await message.reply(text)
 
 
 @router.message(Command("angrybattle", ignore_case=True), GROUP_CHATS)
-async def cmd_angry_battle(message: Message, bot: Bot, pool: asyncpg.Pool):
+async def cmd_angry_battle(message: Message, pool: asyncpg.Pool):
     photo_id, text = await perform_battle(pool, message.chat.id, message.from_user)
     if photo_id:
-        await bot.send_photo(message.chat.id, photo_id, caption=text)
+        await message.reply_photo(photo_id, caption=text)
     else:
-        await message.answer(text)
+        await message.reply(text)
 
 
 @router.message(Command("angrytop", ignore_case=True), GROUP_CHATS)
 async def cmd_angry_top(message: Message, pool: asyncpg.Pool):
-    await message.answer(await perform_top(pool, message.chat.id))
+    await message.reply(await perform_top(pool, message.chat.id))
 
 
 @router.message(Command("angryinfo", ignore_case=True), GROUP_CHATS)
@@ -2059,13 +2059,13 @@ async def cmd_angry_info(message: Message, command: CommandObject, bot: Bot, poo
             try:
                 target = await bot.get_chat(f"@{arg}")
             except TelegramAPIError:
-                await message.answer("<b>Не нашёл такого игрока.</b>")
+                await message.reply("<b>Не нашёл такого игрока.</b>")
                 return
         else:
             target = message.from_user
 
     if getattr(target, "is_bot", False):
-        await message.answer("<b>У ботов нет профиля игрока.</b>")
+        await message.reply("<b>У ботов нет профиля игрока.</b>")
         return
 
     target_id = target.id
@@ -2091,26 +2091,26 @@ async def cmd_angry_info(message: Message, command: CommandObject, bot: Bot, poo
     caption = "\n".join(lines)
 
     if best_card:
-        await message.answer_photo(best_card["photo_id"], caption=caption)
+        await message.reply_photo(best_card["photo_id"], caption=caption)
     else:
-        await message.answer(caption)
+        await message.reply(caption)
 
 
 async def handle_steal(message: Message, pool: asyncpg.Pool) -> None:
     reply = message.reply_to_message
     if reply is None or reply.from_user is None:
-        await message.answer(
+        await message.reply(
             "<b>🕵️ Чтобы украсть монеты, ответь этой командой на сообщение игрока.</b>"
         )
         return
     target = reply.from_user
     if target.is_bot:
-        await message.answer("<b>🤖 У ботов красть нечего.</b>")
+        await message.reply("<b>🤖 У ботов красть нечего.</b>")
         return
     if target.id == message.from_user.id:
-        await message.answer("<b>🙃 Нельзя красть у самого себя.</b>")
+        await message.reply("<b>🙃 Нельзя красть у самого себя.</b>")
         return
-    await message.answer(await perform_steal(pool, message.chat.id, message.from_user, target))
+    await message.reply(await perform_steal(pool, message.chat.id, message.from_user, target))
 
 
 @router.message(Command("angrysteal", ignore_case=True), GROUP_CHATS)
@@ -2124,38 +2124,38 @@ async def cmd_steal_word(message: Message, pool: asyncpg.Pool):
 
 
 @router.callback_query(F.data == "group:open", GROUP_CHATS)
-async def cb_group_open(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
+async def cb_group_open(callback: CallbackQuery, pool: asyncpg.Pool):
     photo_id, text = await perform_open(pool, callback.message.chat.id, callback.from_user)
     if photo_id:
-        await bot.send_photo(callback.message.chat.id, photo_id, caption=text)
+        await callback.message.reply_photo(photo_id, caption=text)
     else:
-        await callback.message.answer(text)
+        await callback.message.reply(text)
     await callback.answer()
 
 
 @router.callback_query(F.data == "group:class", GROUP_CHATS)
-async def cb_group_class(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
+async def cb_group_class(callback: CallbackQuery, pool: asyncpg.Pool):
     photo_id, text = await perform_class(pool, callback.message.chat.id, callback.from_user)
     if photo_id:
-        await bot.send_photo(callback.message.chat.id, photo_id, caption=text)
+        await callback.message.reply_photo(photo_id, caption=text)
     else:
-        await callback.message.answer(text)
+        await callback.message.reply(text)
     await callback.answer()
 
 
 @router.callback_query(F.data == "group:battle", GROUP_CHATS)
-async def cb_group_battle(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
+async def cb_group_battle(callback: CallbackQuery, pool: asyncpg.Pool):
     photo_id, text = await perform_battle(pool, callback.message.chat.id, callback.from_user)
     if photo_id:
-        await bot.send_photo(callback.message.chat.id, photo_id, caption=text)
+        await callback.message.reply_photo(photo_id, caption=text)
     else:
-        await callback.message.answer(text)
+        await callback.message.reply(text)
     await callback.answer()
 
 
 @router.callback_query(F.data == "group:top", GROUP_CHATS)
 async def cb_group_top(callback: CallbackQuery, pool: asyncpg.Pool):
-    await callback.message.answer(await perform_top(pool, callback.message.chat.id))
+    await callback.message.reply(await perform_top(pool, callback.message.chat.id))
     await callback.answer()
 
 
@@ -2169,28 +2169,28 @@ _pending_clan_delete: dict[int, float] = {}
 async def cmd_clan_create(message: Message, command: CommandObject, pool: asyncpg.Pool):
     name = (command.args or "").strip()
     if not name or not message.photo:
-        await message.answer(
+        await message.reply(
             "<b>✏️ Пришли фото клана с подписью: /clancreate Название</b>"
         )
         return
     if len(name) > CLAN_NAME_MAX_LEN:
-        await message.answer(f"<b>Слишком длинное название (максимум {CLAN_NAME_MAX_LEN} символов).</b>")
+        await message.reply(f"<b>Слишком длинное название (максимум {CLAN_NAME_MAX_LEN} символов).</b>")
         return
     if await get_user_clan(pool, message.from_user.id):
-        await message.answer("<b>Ты уже состоишь в клане.</b>")
+        await message.reply("<b>Ты уже состоишь в клане.</b>")
         return
     if await clan_name_taken(pool, name):
-        await message.answer("<b>Клан с таким названием уже существует.</b>")
+        await message.reply("<b>Клан с таким названием уже существует.</b>")
         return
 
     money = await get_chat_money(pool, message.chat.id, message.from_user.id)
     if money < CLAN_CREATE_COST:
-        await message.answer(f"<b>💰 Не хватает монет. Нужно {CLAN_CREATE_COST}, у тебя {money}.</b>")
+        await message.reply(f"<b>💰 Не хватает монет. Нужно {CLAN_CREATE_COST}, у тебя {money}.</b>")
         return
 
     photo_id = message.photo[-1].file_id
     await create_clan(pool, name, photo_id, message.from_user.id, message.from_user.full_name, message.chat.id)
-    await message.answer_photo(
+    await message.reply_photo(
         photo_id,
         caption=f"<b>🏰 Клан «{html.escape(name)}» создан!\n\n👑 Основатель: {html.escape(message.from_user.full_name)}</b>",
     )
@@ -2200,35 +2200,35 @@ async def cmd_clan_create(message: Message, command: CommandObject, pool: asyncp
 async def cmd_clan_invite(message: Message, pool: asyncpg.Pool):
     clan = await get_user_clan(pool, message.from_user.id)
     if not clan:
-        await message.answer("<b>У тебя нет клана.</b>")
+        await message.reply("<b>У тебя нет клана.</b>")
         return
     if clan["creator_id"] != message.from_user.id:
-        await message.answer("<b>Приглашать в клан может только его создатель.</b>")
+        await message.reply("<b>Приглашать в клан может только его создатель.</b>")
         return
 
     reply = message.reply_to_message
     if reply is None or reply.from_user is None:
-        await message.answer("<b>Ответь этой командой на сообщение игрока, которого хочешь пригласить.</b>")
+        await message.reply("<b>Ответь этой командой на сообщение игрока, которого хочешь пригласить.</b>")
         return
     target = reply.from_user
     if target.is_bot:
-        await message.answer("<b>Ботов приглашать нельзя.</b>")
+        await message.reply("<b>Ботов приглашать нельзя.</b>")
         return
     if target.id == message.from_user.id:
-        await message.answer("<b>Нельзя пригласить самого себя.</b>")
+        await message.reply("<b>Нельзя пригласить самого себя.</b>")
         return
     if await get_user_clan(pool, target.id):
-        await message.answer("<b>Этот игрок уже состоит в клане.</b>")
+        await message.reply("<b>Этот игрок уже состоит в клане.</b>")
         return
     if await clan_member_count(pool, clan["id"]) >= CLAN_MAX_MEMBERS:
-        await message.answer(f"<b>В клане уже максимум участников ({CLAN_MAX_MEMBERS}).</b>")
+        await message.reply(f"<b>В клане уже максимум участников ({CLAN_MAX_MEMBERS}).</b>")
         return
 
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Принять", callback_data=f"clan:accept:{clan['id']}:{target.id}")
     kb.button(text="❌ Отклонить", callback_data=f"clan:decline:{clan['id']}:{target.id}")
     kb.adjust(2)
-    await message.answer(
+    await message.reply(
         f"<b>📨 {html.escape(target.full_name)}, тебя приглашают в клан «{html.escape(clan['name'])}»!</b>",
         reply_markup=kb.as_markup(),
     )
@@ -2277,10 +2277,10 @@ async def clan_invite_decline(callback: CallbackQuery):
 async def cmd_clan_delete(message: Message, pool: asyncpg.Pool):
     clan = await get_user_clan(pool, message.from_user.id)
     if not clan:
-        await message.answer("<b>У тебя нет клана.</b>")
+        await message.reply("<b>У тебя нет клана.</b>")
         return
     if clan["creator_id"] != message.from_user.id:
-        await message.answer("<b>Удалить клан может только его создатель.</b>")
+        await message.reply("<b>Удалить клан может только его создатель.</b>")
         return
 
     now = time.time()
@@ -2288,11 +2288,11 @@ async def cmd_clan_delete(message: Message, pool: asyncpg.Pool):
     if last_attempt is not None and now - last_attempt <= CLAN_DELETE_CONFIRM_WINDOW:
         _pending_clan_delete.pop(message.from_user.id, None)
         await delete_clan(pool, clan["id"])
-        await message.answer(f"<b>💥 Клан «{html.escape(clan['name'])}» удалён.</b>")
+        await message.reply(f"<b>💥 Клан «{html.escape(clan['name'])}» удалён.</b>")
         return
 
     _pending_clan_delete[message.from_user.id] = now
-    await message.answer(
+    await message.reply(
         f"<b>⚠️ Чтобы удалить клан «{html.escape(clan['name'])}», отправь /clandelete ещё раз в течение минуты.</b>"
     )
 
@@ -2301,22 +2301,22 @@ async def cmd_clan_delete(message: Message, pool: asyncpg.Pool):
 async def cmd_clan_left(message: Message, pool: asyncpg.Pool):
     clan = await get_user_clan(pool, message.from_user.id)
     if not clan:
-        await message.answer("<b>Ты не состоишь в клане.</b>")
+        await message.reply("<b>Ты не состоишь в клане.</b>")
         return
     if clan["creator_id"] == message.from_user.id:
-        await message.answer(
+        await message.reply(
             "<b>Ты создатель клана — сначала удали его через /clandelete (дважды подряд в течение минуты).</b>"
         )
         return
     await remove_clan_member(pool, message.from_user.id)
-    await message.answer(f"<b>👋 Ты покинул клан «{html.escape(clan['name'])}».</b>")
+    await message.reply(f"<b>👋 Ты покинул клан «{html.escape(clan['name'])}».</b>")
 
 
 @router.message(Command("clantop", ignore_case=True), GROUP_CHATS)
 async def cmd_clan_top(message: Message, pool: asyncpg.Pool):
     clans = await get_clan_top(pool, CLAN_TOP_LIMIT)
     if not clans:
-        await message.answer("<b>📭 Пока нет ни одного клана.</b>")
+        await message.reply("<b>📭 Пока нет ни одного клана.</b>")
         return
 
     medals = ["🥇", "🥈", "🥉"]
@@ -2327,7 +2327,7 @@ async def cmd_clan_top(message: Message, pool: asyncpg.Pool):
             f"{prefix} {html.escape(clan['name'])} — ⚔️ {clan['total_power']} "
             f"({clan['members']}/{CLAN_MAX_MEMBERS})"
         )
-    await message.answer("\n".join(lines) + "</b>")
+    await message.reply("\n".join(lines) + "</b>")
 
 
 @router.message(Command("clan", ignore_case=True), GROUP_CHATS)
@@ -2336,12 +2336,12 @@ async def cmd_clan_info(message: Message, command: CommandObject, pool: asyncpg.
     if query:
         clan = await get_clan_by_name(pool, query)
         if not clan:
-            await message.answer("<b>Клан с таким названием не найден.</b>")
+            await message.reply("<b>Клан с таким названием не найден.</b>")
             return
     else:
         clan = await get_user_clan(pool, message.from_user.id)
         if not clan:
-            await message.answer("<b>Ты не состоишь в клане. Чтобы посмотреть другой: /clan Название</b>")
+            await message.reply("<b>Ты не состоишь в клане. Чтобы посмотреть другой: /clan Название</b>")
             return
 
     members = await get_clan_members(pool, clan["id"])
@@ -2358,7 +2358,7 @@ async def cmd_clan_info(message: Message, command: CommandObject, pool: asyncpg.
         name = html.escape(member["name"] or "Игрок")
         lines.append(f"<b>{i}. {crown}{name} — ⚔️ {member['power']}</b>")
 
-    await message.answer_photo(clan["photo_id"], caption="\n".join(lines))
+    await message.reply_photo(clan["photo_id"], caption="\n".join(lines))
 
 
 # ── Реферальная программа (1% создателю группы) ───────────────────────────
