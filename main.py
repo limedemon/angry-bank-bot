@@ -121,7 +121,7 @@ NON_ADMIN_PRIVATE_TEXT = (
     "Добавь меня в чат и используй там команды /AngryOpen, /AngryClass и /AngryTop.</b>"
 )
 REFERRAL_HOWTO_TEXT = (
-    "<b>💰 Как зарабатывать на своей группе\n\n"
+    "<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Как зарабатывать на своей группе\n\n"
     "1. Добавь меня в свою группу (кнопка ниже).\n"
     "2. Я сам определю создателя группы и начну начислять тебе 1% от всех монет, которые "
     "заработают игроки в этой группе — прямо к твоему балансу, без лишних уведомлений.\n"
@@ -133,7 +133,7 @@ FIELD_PROMPTS = {
     "photo_id": "<b>📸 Пришли новое фото карточки</b>",
     "name": "<b>✏️ Введи новое название карточки</b>",
     "power": "<b>⚔️ Введи новую силу карточки (число)</b>",
-    "money": "<b>💰 Введи новое количество денег (число)</b>",
+    "money": "<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Введи новое количество денег (число)</b>",
 }
 
 CLASS_CARD_FIELDS = ("name", "power", "photo_id", "rarity", "bird")
@@ -147,7 +147,7 @@ MOB_FIELD_PROMPTS = {
     "photo_id": "<b>📸 Пришли новое фото моба</b>",
     "name": "<b>✏️ Введи новое название моба</b>",
     "power": "<b>⚔️ Введи новую силу моба (число)</b>",
-    "money": "<b>💰 Введи новую награду монет за убийство (число)</b>",
+    "money": "<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Введи новую награду монет за убийство (число)</b>",
 }
 
 # ── Редкость карточек ────────────────────────────────────────────────────
@@ -548,11 +548,11 @@ async def apply_airdrop_loot(
                 """,
                 chat_id, user_id, name, amount,
             )
-            lines.append(f"💰 +{amount} монет")
+            lines.append(f"<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> +{amount} монет")
         elif kind == "tokens":
             amount = random.randint(lo, hi)
             await add_player_tokens(conn, user_id, name, amount)
-            lines.append(f"🐟 +{amount} токенов")
+            lines.append(f"<tg-emoji emoji-id='5233482504182212210'>🐟</tg-emoji> +{amount} токенов")
         elif kind == "astral":
             pool_choice = random.choice(("piggy", "class"))
             if pool_choice == "piggy":
@@ -595,7 +595,7 @@ async def apply_airdrop_loot(
                 lines.append(
                     f"🌌 <b>Астральная карточка (копилка): {card_title(card)}</b>\n"
                     f"{rarity_display(card['rarity'])}\n"
-                    f"   ⚔️ +{card['power']} силы · 💰 +{card['money']} монет"
+                    f"   ⚔️ +{card['power']} силы · <tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> +{card['money']} монет"
                 )
             else:
                 await maybe_update_best_class(conn, user_id, card)
@@ -1267,7 +1267,7 @@ def mob_caption(mob: dict, prefix: str) -> str:
         f"<b>{prefix}\n\n"
         f"🐗 {html.escape(mob['name'])}\n"
         f"⚔️ Сила: {mob['power']}\n"
-        f"💰 Награда за убийство: {mob['money']}</b>"
+        f"<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Награда за убийство: {mob['money']}</b>"
     )
 
 
@@ -1287,7 +1287,7 @@ def card_caption(card: dict, prefix: str) -> str:
         f"🃏 {card_title(card)}</b>\n"
         f"{rarity_display(card['rarity'])}\n"
         f"<b>⚔️ Сила: {card['power']}\n"
-        f"💰 Денег: {card['money']}</b>"
+        f"<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Денег: {card['money']}</b>"
     )
 
 
@@ -1355,7 +1355,7 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
         f"🃏 {card_title(card)}</b>\n"
         f"{rarity_display(card['rarity'])}\n\n"
         f"<b>⚔️ +{card['power']} силы\n"
-        f"💰 +{card['money']} монет</b>"
+        f"<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> +{card['money']} монет</b>"
     )
     return card["photo_id"], caption
 
@@ -1385,7 +1385,7 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | N
                 return None, f"<b>⏳ Класс ещё не готов. Попробуй через {minutes} мин {seconds} сек.</b>"
 
             if balance < CLASS_SPIN_COST:
-                return None, f"<b>💰 Не хватает монет. Нужно {CLASS_SPIN_COST}, у тебя {balance}.</b>"
+                return None, f"<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Не хватает монет. Нужно {CLASS_SPIN_COST}, у тебя {balance}.</b>"
 
             await conn.execute(
                 """
@@ -1406,7 +1406,7 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | N
         f"🃏 {card_title(card)}</b>\n"
         f"{rarity_display(card['rarity'])}\n\n"
         f"<b>⚔️ +{card['power']} силы\n"
-        f"💰 −{CLASS_SPIN_COST} монет</b>"
+        f"<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> −{CLASS_SPIN_COST} монет</b>"
     )
     return card["photo_id"], caption
 
@@ -1470,12 +1470,12 @@ async def perform_steal(pool: asyncpg.Pool, chat_id: int, thief, target) -> str:
                     return (
                         f"<b>🥷 Удачная кража!\n\n"
                         f"{thief_mention} обчистил {target_mention}\n"
-                        f"💰 Украдено: {amount}</b>"
+                        f"<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Украдено: {amount}</b>"
                     )
                 return (
                     f"<b>🤏 Частично удачная кража!\n\n"
                     f"{thief_mention} стащил немного у {target_mention}\n"
-                    f"💰 Украдено: {amount}</b>"
+                    f"<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Украдено: {amount}</b>"
                 )
 
             loss = round(thief_money * STEAL_FAIL_LOSS_SHARE)
@@ -1487,7 +1487,7 @@ async def perform_steal(pool: asyncpg.Pool, chat_id: int, thief, target) -> str:
             return (
                 f"<b>🚨 Неудачная кража!\n\n"
                 f"{thief_mention} попался, пытаясь обокрасть {target_mention}\n"
-                f"💰 Потеряно: {loss}</b>"
+                f"<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Потеряно: {loss}</b>"
             )
 
 
@@ -1546,7 +1546,7 @@ async def perform_battle(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | 
     if won:
         caption = (
             f"<b>⚔️ {mention} сразился с «{mob_name}» и одержал победу!\n\n"
-            f"💰 Награда: {mob['money']} монет\n"
+            f"<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Награда: {mob['money']} монет\n"
             f"🔋 Потрачено энергии: {cost} (осталось {energy}/{ENERGY_MAX})</b>"
         )
     else:
@@ -1669,7 +1669,7 @@ async def piggy_list_cb(callback: CallbackQuery, pool: asyncpg.Pool):
     for i, card in enumerate(cards, start=1):
         lines.append(
             f"<b>{i}. {card_title(card)}</b> — {rarity_display(card['rarity'])}\n"
-            f"<b>    ⚔️{card['power']} · 💰{card['money']}</b>"
+            f"<b>    ⚔️{card['power']} · <tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji>{card['money']}</b>"
         )
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ Назад", callback_data="piggy:menu")
@@ -1716,7 +1716,7 @@ async def add_power(message: Message, state: FSMContext):
         return
     await state.update_data(power=power)
     await state.set_state(AddCard.money)
-    await message.answer("<b>💰 Введи количество денег (число)</b>", reply_markup=cancel_kb())
+    await message.answer("<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Введи количество денег (число)</b>", reply_markup=cancel_kb())
 
 
 @router.message(AddCard.money, IsAdminPrivate())
@@ -2175,7 +2175,7 @@ async def mob_list_cb(callback: CallbackQuery, pool: asyncpg.Pool):
     for i, mob in enumerate(mobs, start=1):
         lines.append(
             f"<b>{i}. {html.escape(mob['name'])}</b>\n"
-            f"<b>    ⚔️{mob['power']} · 💰{mob['money']}</b>"
+            f"<b>    ⚔️{mob['power']} · <tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji>{mob['money']}</b>"
         )
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ Назад", callback_data="mob:menu")
@@ -2220,7 +2220,7 @@ async def mob_add_power(message: Message, state: FSMContext):
         return
     await state.update_data(power=power)
     await state.set_state(AddMob.money)
-    await message.answer("<b>💰 Введи награду монет за убийство (число)</b>", reply_markup=cancel_kb("mob:cancel"))
+    await message.answer("<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Введи награду монет за убийство (число)</b>", reply_markup=cancel_kb("mob:cancel"))
 
 
 @router.message(AddMob.money, IsAdminPrivate())
@@ -2348,8 +2348,8 @@ def render_profile(
     lines += [
         "",
         f"<b>⚔️ Сила:</b> {power}",
-        f"<b>💰 Монет:</b> {money}",
-        f"<b>🐟 Токенов:</b> {tokens}",
+        f"<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Монет:</b> {money}",
+        f"<b><tg-emoji emoji-id='5233482504182212210'>🐟</tg-emoji> Токенов:</b> {tokens}",
         f"<b>🔋 Энергия:</b> {energy}/{ENERGY_MAX}",
         f"<b>🏰 Клан:</b> {html.escape(clan_name) if clan_name else 'нет'}",
     ]
@@ -2593,7 +2593,7 @@ async def cmd_clan_create(message: Message, command: CommandObject, pool: asyncp
 
     money = await get_chat_money(pool, message.chat.id, message.from_user.id)
     if money < CLAN_CREATE_COST:
-        await message.reply(f"<b>💰 Не хватает монет. Нужно {CLAN_CREATE_COST}, у тебя {money}.</b>")
+        await message.reply(f"<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Не хватает монет. Нужно {CLAN_CREATE_COST}, у тебя {money}.</b>")
         return
 
     photo_id = message.photo[-1].file_id
