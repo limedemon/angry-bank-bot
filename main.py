@@ -116,10 +116,6 @@ GROUP_INTRO_TEXT = (
     "🏆 /clantop — топ кланов по силе\n"
     "ℹ️ /clan [название] — инфо о клане</b>"
 )
-NON_ADMIN_PRIVATE_TEXT = (
-    "<b>🐦 Привет! Я работаю в группах.\n\n"
-    "Добавь меня в чат и используй там команды /AngryOpen, /AngryClass и /AngryTop.</b>"
-)
 REFERRAL_HOWTO_TEXT = (
     "<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Как зарабатывать на своей группе\n\n"
     "1. Добавь меня в свою группу (кнопка ниже).\n"
@@ -1634,11 +1630,14 @@ async def cmd_start_private(message: Message, command: CommandObject, state: FSM
         return
 
     admin_id = await get_admin_id(pool)
+    kb = None
     if message.from_user.id == admin_id:
         await state.clear()
-        await message.answer(admin_menu_text(), reply_markup=admin_menu_kb())
-    else:
-        await message.answer(NON_ADMIN_PRIVATE_TEXT)
+        builder = InlineKeyboardBuilder()
+        builder.button(text="⚙️ Админ-панель", callback_data="admin:menu")
+        builder.adjust(1)
+        kb = builder.as_markup()
+    await send_own_profile(message, pool, reply_markup=kb)
 
 
 @router.callback_query(F.data == "admin:menu", IsAdminPrivate())
@@ -2384,15 +2383,15 @@ def render_profile(
     return "\n".join(lines)
 
 
-@router.message(F.chat.type == "private")
-async def show_profile(message: Message, pool: asyncpg.Pool):
+async def send_own_profile(message: Message, pool: asyncpg.Pool, reply_markup=None) -> None:
     user = message.from_user
     summary = await get_player_summary(pool, user.id)
     if summary["chats"] == 0:
         await message.answer(
             "<b>👤 Профиль\n\n"
             "Ты пока не крутил копилку ни в одной группе.\n"
-            "Добавь бота в чат и используй там 🎰 /AngryOpen!</b>"
+            "Добавь бота в чат и используй там 🎰 /AngryOpen!</b>",
+            reply_markup=reply_markup,
         )
         return
 
@@ -2406,9 +2405,14 @@ async def show_profile(message: Message, pool: asyncpg.Pool):
         clan["name"] if clan else None, best_class,
     )
     if best_class:
-        await message.answer_photo(best_class["photo_id"], caption=text)
+        await message.answer_photo(best_class["photo_id"], caption=text, reply_markup=reply_markup)
     else:
-        await message.answer(text)
+        await message.answer(text, reply_markup=reply_markup)
+
+
+@router.message(F.chat.type == "private")
+async def show_profile(message: Message, pool: asyncpg.Pool):
+    await send_own_profile(message, pool)
 
 
 # ── Групповые команды ─────────────────────────────────────────────────────
