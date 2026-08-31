@@ -399,6 +399,14 @@ SCHEMA_STATEMENTS = (
         title TEXT NOT NULL
     )
     """,
+    # bot_chats раньше заполнялась только при добавлении бота в группу, поэтому
+    # все группы, где бот оказался раньше появления таблицы, в неё не попали —
+    # и рассылки (аирдропы, промо) их не видели. Добираем их из chat_owners.
+    """
+    INSERT INTO bot_chats (chat_id, title)
+    SELECT chat_id, chat_title FROM chat_owners
+    ON CONFLICT (chat_id) DO NOTHING
+    """,
     """
     CREATE TABLE IF NOT EXISTS airdrops (
         id SERIAL PRIMARY KEY,
@@ -1065,6 +1073,26 @@ class AdminAssignMiddleware(BaseMiddleware):
         pool = data.get("pool")
         if pool is not None and event.from_user is not None:
             await ensure_admin(pool, event.from_user.id)
+        return await handler(event, data)
+
+
+class TrackChatMiddleware(BaseMiddleware):
+    """Держит bot_chats в актуальном состоянии по любой активности в группе.
+
+    my_chat_member срабатывает только в момент добавления бота, поэтому группы,
+    где бот оказался раньше (или чьё событие потерялось), иначе выпадают из рассылок.
+    """
+
+    async def __call__(self, handler, event: Message, data):
+        pool = data.get("pool")
+        if pool is not None and event.chat.type in ("group", "supergroup"):
+            await pool.execute(
+                """
+                INSERT INTO bot_chats (chat_id, title) VALUES ($1, $2)
+                ON CONFLICT (chat_id) DO UPDATE SET title = EXCLUDED.title
+                """,
+                event.chat.id, event.chat.title or "группа",
+            )
         return await handler(event, data)
 
 
@@ -3044,6 +3072,7 @@ async def main() -> None:
         bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         dp = Dispatcher(storage=MemoryStorage())
         dp.message.outer_middleware(AdminAssignMiddleware())
+        dp.message.outer_middleware(TrackChatMiddleware())
         dp.message.outer_middleware(OwnerNotifyMiddleware())
         dp.include_router(router)
 
