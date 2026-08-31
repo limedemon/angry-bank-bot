@@ -56,6 +56,7 @@ AIRDROP_CHAT_STAGGER_MAX = 30
 AIRDROP_EXPIRE_SECONDS = 5 * 60
 AIRDROP_EXPIRE_CHECK_INTERVAL = 30
 AIRDROP_MAX_CLAIMS_PER_CYCLE = 3
+AIRDROP_MIN_MEMBERS = 5
 
 # code -> (название, "1 в N" -> вес выпадения, иконка)
 AIRDROP_TIERS = (
@@ -2947,8 +2948,39 @@ def airdrop_claim_kb(airdrop_id: int):
     return kb.as_markup()
 
 
+async def count_human_members(bot: Bot, chat_id: int) -> int | None:
+    """Участники чата без ботов, или None если посчитать не удалось.
+
+    Telegram не отдаёт список всех участников — видны только админы, поэтому
+    вычесть можно лишь ботов-админов (включая самого себя). Боты-неадмины
+    в счёт всё же попадут.
+    """
+    try:
+        total = await bot.get_chat_member_count(chat_id)
+    except TelegramAPIError as error:
+        logging.warning("Не удалось получить число участников чата %s: %s", chat_id, error)
+        return None
+
+    bots = 0
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        bots = sum(1 for admin in admins if admin.user.is_bot)
+    except TelegramAPIError:
+        pass
+    return max(0, total - bots)
+
+
 async def spawn_airdrop_in_chat(bot: Bot, pool: asyncpg.Pool, chat_id: int, chat_title: str) -> None:
     await asyncio.sleep(random.uniform(AIRDROP_CHAT_STAGGER_MIN, AIRDROP_CHAT_STAGGER_MAX))
+
+    members = await count_human_members(bot, chat_id)
+    if members is not None and members < AIRDROP_MIN_MEMBERS:
+        logging.info(
+            "Аирдроп пропущен: в чате %s (%s) только %s участник(ов), нужно %s",
+            chat_id, chat_title, members, AIRDROP_MIN_MEMBERS,
+        )
+        return
+
     code, label, icon = roll_airdrop_tier()
     airdrop_id = await pool.fetchval(
         "INSERT INTO airdrops (chat_id, message_id, tier, created_at) VALUES ($1, 0, $2, $3) RETURNING id",
