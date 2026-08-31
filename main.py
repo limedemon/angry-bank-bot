@@ -1,12 +1,9 @@
 import asyncio
-import hashlib
 import html
 import logging
 import os
 import random
-import subprocess
 import time
-from pathlib import Path
 
 import asyncpg
 from aiogram import Bot, BaseMiddleware, Dispatcher, F, Router
@@ -439,32 +436,19 @@ async def set_admin(pool: asyncpg.Pool, user_id: int) -> None:
     await pool.execute("UPDATE bot_state SET admin_id = $1 WHERE id = 1", user_id)
 
 
-async def apply_admin_override(bot: Bot, pool: asyncpg.Pool) -> None:
-    """Ставит админом ADMIN_USERNAME, если он задан.
+async def apply_admin_override(pool: asyncpg.Pool) -> None:
+    """Закрепляет админом ADMIN_USER_ID, если он задан.
 
     Правило «админ = первый написавший боту» одноразовое: если им стал не тот
-    человек, сменить его иначе нельзя. Резолв идёт по username через getChat —
-    сработает, только если у пользователя есть username и он не скрыт.
+    человек, сменить его иначе нельзя. ID берём константой, а не резолвом по
+    username, — чтобы не зависеть от доступности getChat.
     """
-    if not ADMIN_USERNAME:
+    if not ADMIN_USER_ID:
         return
-    try:
-        chat = await bot.get_chat(f"@{ADMIN_USERNAME}")
-    except TelegramAPIError as error:
-        logging.warning("Не удалось определить админа @%s: %s", ADMIN_USERNAME, error)
+    if await get_admin_id(pool) == ADMIN_USER_ID:
         return
-    if await get_admin_id(pool) == chat.id:
-        return
-    await set_admin(pool, chat.id)
-    logging.info("Админ назначен: @%s (id %s)", ADMIN_USERNAME, chat.id)
-
-
-async def get_last_deploy_version(pool: asyncpg.Pool) -> str | None:
-    return await pool.fetchval("SELECT last_deploy_version FROM bot_state WHERE id = 1")
-
-
-async def set_last_deploy_version(pool: asyncpg.Pool, version: str) -> None:
-    await pool.execute("UPDATE bot_state SET last_deploy_version = $1 WHERE id = 1", version)
+    await set_admin(pool, ADMIN_USER_ID)
+    logging.info("Админ назначен: id %s", ADMIN_USER_ID)
 
 
 async def get_active_chat_ids(pool: asyncpg.Pool) -> list[int]:
@@ -2890,48 +2874,6 @@ async def on_bot_membership_change(event: ChatMemberUpdated, bot: Bot, pool: asy
     )
 
 
-# ── Лог обновлений ───────────────────────────────────────────────────────
-
-def get_deploy_version() -> tuple[str, str]:
-    """Возвращает (version_id, описание) — по git-коммиту, либо по хешу файла, если git недоступен."""
-    base_dir = Path(__file__).resolve().parent
-    try:
-        commit_hash = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"], cwd=base_dir, text=True, stderr=subprocess.DEVNULL
-        ).strip()
-        commit_msg = subprocess.check_output(
-            ["git", "log", "-1", "--pretty=%s"], cwd=base_dir, text=True, stderr=subprocess.DEVNULL
-        ).strip()
-        commit_date = subprocess.check_output(
-            ["git", "log", "-1", "--pretty=%cd", "--date=format:%d.%m.%Y %H:%M"],
-            cwd=base_dir, text=True, stderr=subprocess.DEVNULL,
-        ).strip()
-        details = f"📝 {html.escape(commit_msg)}\n🕐 {commit_date}"
-        return commit_hash, details
-    except Exception:
-        digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:8]
-        return digest, "📝 Локальная версия (git недоступен)"
-
-
-async def notify_deploy(bot: Bot, pool: asyncpg.Pool) -> None:
-    version_id, details = get_deploy_version()
-    if await get_last_deploy_version(pool) == version_id:
-        return
-
-    text = (
-        f"<b>🚀 Angry Bank обновился!\n\n"
-        f"{details}\n"
-        f"🔖 Версия <code>{version_id}</code></b>"
-    )
-    for chat_id in await get_active_chat_ids(pool):
-        try:
-            await bot.send_message(chat_id, text)
-        except TelegramAPIError as error:
-            logging.warning("Не удалось отправить лог обновления в чат %s: %s", chat_id, error)
-
-    await set_last_deploy_version(pool, version_id)
-
-
 # ── Промо реферальной программы ─────────────────────────────────────────
 
 REFERRAL_PROMO_INTERVAL = 1 * 60 * 60
@@ -3128,8 +3070,8 @@ async def set_bot_commands(bot: Bot) -> None:
 
 BOT_TOKEN = "8822713742:AAHYx6SzmdiOyrESTgnrDcNoTYpxzrlP5K4"
 # Кто админ бота. Если задан — перебивает правило «админ = первый написавший»
-# (по нему админом мог случайно стать посторонний). Username без @.
-ADMIN_USERNAME = "super332"
+# (по нему админом мог случайно стать посторонний).
+ADMIN_USER_ID = 1018561747
 DATABASE_URL = (
     "postgresql://bothost_db_070b39e25784:-IpoMUbOGfL-gKUZj9kDRhD7RrJ02C7NOcrrvFBIxWo"
     "@node1.pghost.ru:16036/bothost_db_070b39e25784"
@@ -3154,8 +3096,7 @@ async def main() -> None:
 
         await set_bot_commands(bot)
         await bot.delete_webhook(drop_pending_updates=True)
-        await apply_admin_override(bot, pool)
-        await notify_deploy(bot, pool)
+        await apply_admin_override(pool)
 
         me = await bot.get_me()
         spawn_background_task(referral_promo_loop(bot, pool, me.username))
