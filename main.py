@@ -435,6 +435,30 @@ async def ensure_admin(pool: asyncpg.Pool, user_id: int) -> None:
     )
 
 
+async def set_admin(pool: asyncpg.Pool, user_id: int) -> None:
+    await pool.execute("UPDATE bot_state SET admin_id = $1 WHERE id = 1", user_id)
+
+
+async def apply_admin_override(bot: Bot, pool: asyncpg.Pool) -> None:
+    """Ставит админом ADMIN_USERNAME, если он задан.
+
+    Правило «админ = первый написавший боту» одноразовое: если им стал не тот
+    человек, сменить его иначе нельзя. Резолв идёт по username через getChat —
+    сработает, только если у пользователя есть username и он не скрыт.
+    """
+    if not ADMIN_USERNAME:
+        return
+    try:
+        chat = await bot.get_chat(f"@{ADMIN_USERNAME}")
+    except TelegramAPIError as error:
+        logging.warning("Не удалось определить админа @%s: %s", ADMIN_USERNAME, error)
+        return
+    if await get_admin_id(pool) == chat.id:
+        return
+    await set_admin(pool, chat.id)
+    logging.info("Админ назначен: @%s (id %s)", ADMIN_USERNAME, chat.id)
+
+
 async def get_last_deploy_version(pool: asyncpg.Pool) -> str | None:
     return await pool.fetchval("SELECT last_deploy_version FROM bot_state WHERE id = 1")
 
@@ -1619,6 +1643,19 @@ async def safe_edit_text(message: Message, text: str, reply_markup=None) -> None
 
 
 # ── Приватные сообщения (админ-панель) ───────────────────────────────────
+
+@router.message(Command("whoami", ignore_case=True), F.chat.type == "private")
+async def cmd_whoami(message: Message, pool: asyncpg.Pool):
+    admin_id = await get_admin_id(pool)
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "— (username не задан)"
+    await message.answer(
+        f"<b>🪪 Твои данные</b>\n\n"
+        f"ID: <code>{user.id}</code>\n"
+        f"Username: {html.escape(username)}\n"
+        f"Админ бота: {'да ✅' if user.id == admin_id else 'нет ❌'}"
+    )
+
 
 @router.message(CommandStart(), F.chat.type == "private")
 async def cmd_start_private(message: Message, command: CommandObject, state: FSMContext, bot: Bot, pool: asyncpg.Pool):
@@ -3090,6 +3127,9 @@ async def set_bot_commands(bot: Bot) -> None:
 
 
 BOT_TOKEN = "8822713742:AAHYx6SzmdiOyrESTgnrDcNoTYpxzrlP5K4"
+# Кто админ бота. Если задан — перебивает правило «админ = первый написавший»
+# (по нему админом мог случайно стать посторонний). Username без @.
+ADMIN_USERNAME = "super332"
 DATABASE_URL = (
     "postgresql://bothost_db_070b39e25784:-IpoMUbOGfL-gKUZj9kDRhD7RrJ02C7NOcrrvFBIxWo"
     "@node1.pghost.ru:16036/bothost_db_070b39e25784"
@@ -3114,6 +3154,7 @@ async def main() -> None:
 
         await set_bot_commands(bot)
         await bot.delete_webhook(drop_pending_updates=True)
+        await apply_admin_override(bot, pool)
         await notify_deploy(bot, pool)
 
         me = await bot.get_me()
