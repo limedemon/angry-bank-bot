@@ -1182,6 +1182,8 @@ def admin_menu_kb():
     kb.button(text="🎓 Класс", callback_data="class:menu")
     kb.button(text="🐗 Мобы", callback_data="mob:menu")
     kb.button(text="🌐 Все группы", callback_data="chats:menu")
+    kb.button(text="📣 Разослать рекламу", callback_data="admin:promo")
+    kb.button(text="🎁 Запустить аирдроп", callback_data="admin:airdrop")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -1680,6 +1682,30 @@ async def chats_menu_cb(callback: CallbackQuery, pool: asyncpg.Pool):
         reply_markup=chats_list_kb(chats),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "admin:promo", IsAdminPrivate())
+async def admin_promo_cb(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
+    chats = await get_active_chats(pool)
+    if not chats:
+        await callback.answer("Бот пока не состоит ни в одной группе", show_alert=True)
+        return
+    await callback.answer(f"Рассылаю рекламу в {len(chats)} чат(ов)…")
+    me = await bot.get_me()
+    spawn_background_task(broadcast_referral_promo(bot, pool, me.username))
+
+
+@router.callback_query(F.data == "admin:airdrop", IsAdminPrivate())
+async def admin_airdrop_cb(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
+    chats = await get_active_chats(pool)
+    if not chats:
+        await callback.answer("Бот пока не состоит ни в одной группе", show_alert=True)
+        return
+    await callback.answer(
+        f"Запускаю аирдроп в {len(chats)} чат(ов). Дропы появятся в течение "
+        f"{AIRDROP_CHAT_STAGGER_MIN}-{AIRDROP_CHAT_STAGGER_MAX} сек."
+    )
+    spawn_background_task(spawn_airdrop_cycle(bot, pool))
 
 
 @router.callback_query(F.data.startswith("chats:info:"), IsAdminPrivate())
