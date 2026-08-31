@@ -20,6 +20,7 @@ from aiogram.types import (
     BotCommandScopeAllPrivateChats,
     CallbackQuery,
     ChatMemberUpdated,
+    InputMediaPhoto,
     Message,
     TelegramObject,
 )
@@ -59,6 +60,8 @@ SETTINGS_SPEC = {
     "battle_cooldown_min": ("energy", "Кулдаун боя", "мин", 5, 1),
     "battle_energy_min": ("energy", "Энергии за бой (от)", "⚡", 3, 0),
     "battle_energy_max": ("energy", "Энергии за бой (до)", "⚡", 5, 0),
+    "multi_x2_chance": ("multi", "Шанс ×2 крутки", "%", 10, 0),
+    "multi_x3_chance": ("multi", "Шанс ×3 крутки", "%", 5, 0),
 }
 
 SETTINGS_SECTIONS = {
@@ -66,6 +69,7 @@ SETTINGS_SECTIONS = {
     "class": "🎓 Класс",
     "airdrop": "🎁 Аирдропы",
     "energy": "⚡ Энергия и бои",
+    "multi": "🎲 Множители круток",
 }
 
 _settings_cache: dict[str, int] = {}
@@ -951,6 +955,26 @@ async def draw_random_class_card(conn: asyncpg.Connection) -> dict | None:
     return _weighted_card_pick(rows)
 
 
+def roll_spin_multiplier() -> int:
+    """Сколько карточек выпадет за одну крутку: ×1, ×2 или ×3."""
+    roll = random.random() * 100
+    x3 = setting("multi_x3_chance")
+    x2 = setting("multi_x2_chance")
+    if roll < x3:
+        return 3
+    if roll < x3 + x2:
+        return 2
+    return 1
+
+
+def multiplier_banner(multiplier: int) -> str:
+    if multiplier >= 3:
+        return "🔥 <b>×3 КРУТКА!</b>\n\n"
+    if multiplier == 2:
+        return "✨ <b>×2 крутка!</b>\n\n"
+    return ""
+
+
 def _regen_energy(energy: int, updated_at: float, now: float) -> tuple[int, float]:
     regen_seconds = setting("energy_regen_min") * 60
     regenerated = int((now - updated_at) // regen_seconds)
@@ -1426,14 +1450,40 @@ def class_card_caption(card: dict, prefix: str) -> str:
 
 # ── Игровая логика ───────────────────────────────────────────────────────
 
-async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | None, str]:
+async def reply_spin_result(message: Message, photos: list[str], text: str) -> None:
+    """Результат крутки одним сообщением: фото, альбом на ×2/×3 или просто текст.
+
+    У альбома подпись может быть только у первого элемента — туда и уходит
+    описание всех выпавших карточек.
+    """
+    if not photos:
+        await message.reply(text)
+    elif len(photos) == 1:
+        await message.reply_photo(photos[0], caption=text)
+    else:
+        media = [InputMediaPhoto(media=photos[0], caption=text)]
+        media += [InputMediaPhoto(media=photo) for photo in photos[1:]]
+        await message.reply_media_group(media)
+
+
+def cards_summary(cards: list[dict], with_money: bool) -> str:
+    """Список выпавших карточек — по строке на каждую."""
+    lines = []
+    for card in cards:
+        line = f"<b>🃏 {card_title(card)}</b>\n{rarity_display(card['rarity'])}\n<b>⚔️ +{card['power']} силы"
+        if with_money:
+            line += (
+                f" · <tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> "
+                f"+{card['money']} монет"
+            )
+        lines.append(line + "</b>")
+    return "\n\n".join(lines)
+
+
+async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[list[str], str]:
     now = time.time()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            card = await draw_random_card(conn)
-            if card is None:
-                return None, "<b>🕳 Копилка пока пуста — админ ещё не добавил карточки.</b>"
-
             player_row = await conn.fetchrow(
                 "SELECT last_open FROM players WHERE user_id = $1 FOR UPDATE", user.id
             )
@@ -1441,7 +1491,18 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
             remaining = setting("piggy_cooldown_min") * 60 - (now - last_open)
             if remaining > 0:
                 minutes, seconds = divmod(int(remaining), 60)
-                return None, f"<b>⏳ Копилка ещё не наполнилась. Попробуй через {minutes} мин {seconds} сек.</b>"
+                return [], f"<b>⏳ Копилка ещё не наполнилась. Попробуй через {minutes} мин {seconds} сек.</b>"
+
+            multiplier = roll_spin_multiplier()
+            cards = []
+            for _ in range(multiplier):
+                card = await draw_random_card(conn)
+                if card is None:
+                    return [], "<b>🕳 Копилка пока пуста — админ ещё не добавил карточки.</b>"
+                cards.append(card)
+
+            total_power = sum(card["power"] for card in cards)
+            total_money = sum(card["money"] for card in cards)
 
             await conn.execute(
                 """
@@ -1452,15 +1513,16 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
                     money = chat_profiles.money + EXCLUDED.money,
                     opens = chat_profiles.opens + 1
                 """,
-                chat_id, user.id, user.full_name, card["money"],
+                chat_id, user.id, user.full_name, total_money,
             )
-            await add_player_power(conn, user.id, user.full_name, card["power"])
+            await add_player_power(conn, user.id, user.full_name, total_power)
             await set_player_cooldown(conn, user.id, user.full_name, "last_open", now)
-            await maybe_update_best_card(conn, user.id, card)
+            for card in cards:
+                await maybe_update_best_card(conn, user.id, card)
 
             # Реферальные 1% владельцу группы — прибавляются прямо к его основным
             # деньгам (не отдельным счётчиком), молча, без уведомлений.
-            referral_amount = round(card["money"] * 0.01)
+            referral_amount = round(total_money * 0.01)
             if referral_amount > 0:
                 await conn.execute(
                     """
@@ -1475,23 +1537,22 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
                 )
 
     caption = (
-        f"<b>🎉 <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> крутит копилку!\n\n"
-        f"🃏 {card_title(card)}</b>\n"
-        f"{rarity_display(card['rarity'])}\n\n"
-        f"<b>⚔️ +{card['power']} силы\n"
-        f"<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> +{card['money']} монет</b>"
+        f"{multiplier_banner(multiplier)}"
+        f"<b>🎉 <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> крутит копилку!</b>\n\n"
+        f"{cards_summary(cards, with_money=True)}"
     )
-    return card["photo_id"], caption
+    if multiplier > 1:
+        caption += (
+            f"\n\n<b>Итого: ⚔️ +{total_power} силы · "
+            f"<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> +{total_money} монет</b>"
+        )
+    return [card["photo_id"] for card in cards], caption
 
 
-async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | None, str]:
+async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[list[str], str]:
     now = time.time()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            card = await draw_random_class_card(conn)
-            if card is None:
-                return None, "<b>🕳 Класс пока пуст — админ ещё не добавил карточки.</b>"
-
             profile = await conn.fetchrow(
                 "SELECT money FROM chat_profiles WHERE chat_id = $1 AND user_id = $2 FOR UPDATE",
                 chat_id, user.id,
@@ -1506,10 +1567,20 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | N
             remaining = setting("class_cooldown_min") * 60 - (now - last_class)
             if remaining > 0:
                 minutes, seconds = divmod(int(remaining), 60)
-                return None, f"<b>⏳ Класс ещё не готов. Попробуй через {minutes} мин {seconds} сек.</b>"
+                return [], f"<b>⏳ Класс ещё не готов. Попробуй через {minutes} мин {seconds} сек.</b>"
 
             if balance < setting("class_spin_cost"):
-                return None, f"<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Не хватает монет. Нужно {setting('class_spin_cost')}, у тебя {balance}.</b>"
+                return [], f"<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Не хватает монет. Нужно {setting('class_spin_cost')}, у тебя {balance}.</b>"
+
+            multiplier = roll_spin_multiplier()
+            cards = []
+            for _ in range(multiplier):
+                card = await draw_random_class_card(conn)
+                if card is None:
+                    return [], "<b>🕳 Класс пока пуст — админ ещё не добавил карточки.</b>"
+                cards.append(card)
+
+            total_power = sum(card["power"] for card in cards)
 
             await conn.execute(
                 """
@@ -1521,18 +1592,23 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | N
                 """,
                 chat_id, user.id, user.full_name, -setting("class_spin_cost"),
             )
-            await add_player_power(conn, user.id, user.full_name, card["power"])
+            await add_player_power(conn, user.id, user.full_name, total_power)
             await set_player_cooldown(conn, user.id, user.full_name, "last_class", now)
-            await maybe_update_best_class(conn, user.id, card)
+            for card in cards:
+                await maybe_update_best_class(conn, user.id, card)
 
     caption = (
-        f"<b>🎓 <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> крутит класс!\n\n"
-        f"🃏 {card_title(card)}</b>\n"
-        f"{rarity_display(card['rarity'])}\n\n"
-        f"<b>⚔️ +{card['power']} силы\n"
-        f"<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> −{setting('class_spin_cost')} монет</b>"
+        f"{multiplier_banner(multiplier)}"
+        f"<b>🎓 <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> крутит класс!</b>\n\n"
+        f"{cards_summary(cards, with_money=False)}\n\n"
     )
-    return card["photo_id"], caption
+    if multiplier > 1:
+        caption += f"<b>Итого: ⚔️ +{total_power} силы · </b>"
+    caption += (
+        f"<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> "
+        f"−{setting('class_spin_cost')} монет</b>"
+    )
+    return [card["photo_id"] for card in cards], caption
 
 
 async def perform_steal(pool: asyncpg.Pool, chat_id: int, thief, target) -> str:
@@ -2634,20 +2710,14 @@ async def cmd_start_group(message: Message):
 
 @router.message(Command("angryopen", ignore_case=True), GROUP_CHATS)
 async def cmd_angry_open(message: Message, pool: asyncpg.Pool):
-    photo_id, text = await perform_open(pool, message.chat.id, message.from_user)
-    if photo_id:
-        await message.reply_photo(photo_id, caption=text)
-    else:
-        await message.reply(text)
+    photos, text = await perform_open(pool, message.chat.id, message.from_user)
+    await reply_spin_result(message, photos, text)
 
 
 @router.message(Command("angryclass", ignore_case=True), GROUP_CHATS)
 async def cmd_angry_class(message: Message, pool: asyncpg.Pool):
-    photo_id, text = await perform_class(pool, message.chat.id, message.from_user)
-    if photo_id:
-        await message.reply_photo(photo_id, caption=text)
-    else:
-        await message.reply(text)
+    photos, text = await perform_class(pool, message.chat.id, message.from_user)
+    await reply_spin_result(message, photos, text)
 
 
 @router.message(Command("angrybattle", ignore_case=True), GROUP_CHATS)
@@ -2732,21 +2802,15 @@ async def cmd_steal_word(message: Message, pool: asyncpg.Pool):
 
 @router.callback_query(F.data == "group:open", GROUP_CALLBACKS)
 async def cb_group_open(callback: CallbackQuery, pool: asyncpg.Pool):
-    photo_id, text = await perform_open(pool, callback.message.chat.id, callback.from_user)
-    if photo_id:
-        await callback.message.reply_photo(photo_id, caption=text)
-    else:
-        await callback.message.reply(text)
+    photos, text = await perform_open(pool, callback.message.chat.id, callback.from_user)
+    await reply_spin_result(callback.message, photos, text)
     await callback.answer()
 
 
 @router.callback_query(F.data == "group:class", GROUP_CALLBACKS)
 async def cb_group_class(callback: CallbackQuery, pool: asyncpg.Pool):
-    photo_id, text = await perform_class(pool, callback.message.chat.id, callback.from_user)
-    if photo_id:
-        await callback.message.reply_photo(photo_id, caption=text)
-    else:
-        await callback.message.reply(text)
+    photos, text = await perform_class(pool, callback.message.chat.id, callback.from_user)
+    await reply_spin_result(callback.message, photos, text)
     await callback.answer()
 
 
