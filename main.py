@@ -2896,7 +2896,10 @@ async def broadcast_referral_promo(bot: Bot, pool: asyncpg.Pool, bot_username: s
 async def referral_promo_loop(bot: Bot, pool: asyncpg.Pool, bot_username: str) -> None:
     while True:
         await asyncio.sleep(REFERRAL_PROMO_INTERVAL)
-        await broadcast_referral_promo(bot, pool, bot_username)
+        try:
+            await broadcast_referral_promo(bot, pool, bot_username)
+        except Exception:
+            logging.exception("Ошибка в цикле промо 1%")
 
 
 # ── Планировщик аирдропов ────────────────────────────────────────────────
@@ -2944,33 +2947,56 @@ async def spawn_airdrop_in_chat(bot: Bot, pool: asyncpg.Pool, chat_id: int, chat
 
 async def spawn_airdrop_cycle(bot: Bot, pool: asyncpg.Pool) -> None:
     for chat in await get_active_chats(pool):
-        asyncio.create_task(spawn_airdrop_in_chat(bot, pool, chat["chat_id"], chat["title"]))
+        spawn_background_task(spawn_airdrop_in_chat(bot, pool, chat["chat_id"], chat["title"]))
 
 
 async def airdrop_spawn_loop(bot: Bot, pool: asyncpg.Pool) -> None:
     while True:
         await asyncio.sleep(AIRDROP_CYCLE_SECONDS)
-        await spawn_airdrop_cycle(bot, pool)
+        try:
+            await spawn_airdrop_cycle(bot, pool)
+        except Exception:
+            logging.exception("Ошибка в цикле спавна аирдропов")
 
 
 async def expire_airdrops_loop(bot: Bot, pool: asyncpg.Pool) -> None:
     while True:
         await asyncio.sleep(AIRDROP_EXPIRE_CHECK_INTERVAL)
-        cutoff = time.time() - AIRDROP_EXPIRE_SECONDS
-        rows = await pool.fetch(
-            "SELECT id, chat_id, message_id FROM airdrops "
-            "WHERE claimed_by IS NULL AND expired = FALSE AND created_at < $1",
-            cutoff,
-        )
-        for row in rows:
-            await pool.execute("UPDATE airdrops SET expired = TRUE WHERE id = $1", row["id"])
-            try:
-                await bot.edit_message_text(
-                    "<b>💨 Аирдроп исчез — никто не успел его забрать.</b>",
-                    chat_id=row["chat_id"], message_id=row["message_id"],
-                )
-            except TelegramAPIError:
-                pass
+        try:
+            await _expire_airdrops_once(bot, pool)
+        except Exception:
+            logging.exception("Ошибка в цикле протухания аирдропов")
+
+
+async def _expire_airdrops_once(bot: Bot, pool: asyncpg.Pool) -> None:
+    cutoff = time.time() - AIRDROP_EXPIRE_SECONDS
+    rows = await pool.fetch(
+        "SELECT id, chat_id, message_id FROM airdrops "
+        "WHERE claimed_by IS NULL AND expired = FALSE AND created_at < $1",
+        cutoff,
+    )
+    for row in rows:
+        await pool.execute("UPDATE airdrops SET expired = TRUE WHERE id = $1", row["id"])
+        try:
+            await bot.edit_message_text(
+                "<b>💨 Аирдроп исчез — никто не успел его забрать.</b>",
+                chat_id=row["chat_id"], message_id=row["message_id"],
+            )
+        except TelegramAPIError:
+            pass
+
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def spawn_background_task(coro) -> asyncio.Task:
+    """asyncio хранит только слабую ссылку на задачи из create_task — без сильной
+    ссылки где-то ещё сборщик мусора может тихо оборвать задачу посреди работы,
+    без единой ошибки в логах. Поэтому держим ссылки в module-level set."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 # ── Запуск ───────────────────────────────────────────────────────────────
@@ -3026,9 +3052,9 @@ async def main() -> None:
         await notify_deploy(bot, pool)
 
         me = await bot.get_me()
-        asyncio.create_task(referral_promo_loop(bot, pool, me.username))
-        asyncio.create_task(airdrop_spawn_loop(bot, pool))
-        asyncio.create_task(expire_airdrops_loop(bot, pool))
+        spawn_background_task(referral_promo_loop(bot, pool, me.username))
+        spawn_background_task(airdrop_spawn_loop(bot, pool))
+        spawn_background_task(expire_airdrops_loop(bot, pool))
 
         await dp.start_polling(bot, pool=pool)
     finally:
