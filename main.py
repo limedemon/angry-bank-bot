@@ -2466,6 +2466,10 @@ async def show_profile(message: Message, pool: asyncpg.Pool):
 # ── Групповые команды ─────────────────────────────────────────────────────
 
 GROUP_CHATS = F.chat.type.in_({"group", "supergroup"})
+# У CallbackQuery нет .chat — чат лежит в .message, поэтому для кнопок нужен
+# отдельный фильтр. С GROUP_CHATS он молча резолвился в None, и хендлер вообще
+# не вызывался: Telegram крутил «загрузку» на кнопке до таймаута.
+GROUP_CALLBACKS = F.message.chat.type.in_({"group", "supergroup"})
 
 
 @router.message(CommandStart(), GROUP_CHATS)
@@ -2571,7 +2575,7 @@ async def cmd_steal_word(message: Message, pool: asyncpg.Pool):
     await handle_steal(message, pool)
 
 
-@router.callback_query(F.data == "group:open", GROUP_CHATS)
+@router.callback_query(F.data == "group:open", GROUP_CALLBACKS)
 async def cb_group_open(callback: CallbackQuery, pool: asyncpg.Pool):
     photo_id, text = await perform_open(pool, callback.message.chat.id, callback.from_user)
     if photo_id:
@@ -2581,7 +2585,7 @@ async def cb_group_open(callback: CallbackQuery, pool: asyncpg.Pool):
     await callback.answer()
 
 
-@router.callback_query(F.data == "group:class", GROUP_CHATS)
+@router.callback_query(F.data == "group:class", GROUP_CALLBACKS)
 async def cb_group_class(callback: CallbackQuery, pool: asyncpg.Pool):
     photo_id, text = await perform_class(pool, callback.message.chat.id, callback.from_user)
     if photo_id:
@@ -2591,7 +2595,7 @@ async def cb_group_class(callback: CallbackQuery, pool: asyncpg.Pool):
     await callback.answer()
 
 
-@router.callback_query(F.data == "group:battle", GROUP_CHATS)
+@router.callback_query(F.data == "group:battle", GROUP_CALLBACKS)
 async def cb_group_battle(callback: CallbackQuery, pool: asyncpg.Pool):
     photo_id, text = await perform_battle(pool, callback.message.chat.id, callback.from_user)
     if photo_id:
@@ -2601,13 +2605,13 @@ async def cb_group_battle(callback: CallbackQuery, pool: asyncpg.Pool):
     await callback.answer()
 
 
-@router.callback_query(F.data == "group:top", GROUP_CHATS)
+@router.callback_query(F.data == "group:top", GROUP_CALLBACKS)
 async def cb_group_top(callback: CallbackQuery, pool: asyncpg.Pool):
     await callback.message.reply(await perform_top(pool, callback.message.chat.id))
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("airdrop:claim:"), GROUP_CHATS)
+@router.callback_query(F.data.startswith("airdrop:claim:"), GROUP_CALLBACKS)
 async def airdrop_claim_cb(callback: CallbackQuery, pool: asyncpg.Pool):
     airdrop_id = int(callback.data.split(":")[2])
     user = callback.from_user
@@ -2722,7 +2726,7 @@ async def cmd_clan_invite(message: Message, pool: asyncpg.Pool):
     )
 
 
-@router.callback_query(F.data.startswith("clan:accept:"), GROUP_CHATS)
+@router.callback_query(F.data.startswith("clan:accept:"), GROUP_CALLBACKS)
 async def clan_invite_accept(callback: CallbackQuery, pool: asyncpg.Pool):
     _, _, clan_id_str, user_id_str = callback.data.split(":")
     clan_id, invited_id = int(clan_id_str), int(user_id_str)
@@ -2751,7 +2755,7 @@ async def clan_invite_accept(callback: CallbackQuery, pool: asyncpg.Pool):
     await callback.answer("Добро пожаловать в клан!")
 
 
-@router.callback_query(F.data.startswith("clan:decline:"), GROUP_CHATS)
+@router.callback_query(F.data.startswith("clan:decline:"), GROUP_CALLBACKS)
 async def clan_invite_decline(callback: CallbackQuery):
     _, _, _clan_id_str, user_id_str = callback.data.split(":")
     if callback.from_user.id != int(user_id_str):
