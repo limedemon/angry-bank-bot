@@ -2766,7 +2766,7 @@ async def notify_deploy(bot: Bot, pool: asyncpg.Pool) -> None:
 
 # ── Промо реферальной программы ─────────────────────────────────────────
 
-REFERRAL_PROMO_INTERVAL = 3 * 60 * 60
+REFERRAL_PROMO_INTERVAL = 1 * 60 * 60
 
 REFERRAL_PROMO_TEXT = (
     "<b>🎁 Зарабатывай на своей группе!\n\n"
