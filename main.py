@@ -27,9 +27,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 logging.basicConfig(level=logging.INFO)
 
-COOLDOWN_SECONDS = 20 * 60
-CLASS_COOLDOWN_SECONDS = 1 * 60
-CLASS_SPIN_COST = 30
 STEAL_COOLDOWN_SECONDS = 30 * 60
 STEAL_OUTCOME_WEIGHTS = (("success", 20), ("partial", 50), ("fail", 30))
 STEAL_SUCCESS_SHARE = 0.10
@@ -38,22 +35,66 @@ STEAL_FAIL_LOSS_SHARE = 0.05
 CLAN_CREATE_COST = 500
 CLAN_MAX_MEMBERS = 20
 CLAN_DELETE_CONFIRM_WINDOW = 60
-ENERGY_MAX = 100
-ENERGY_REGEN_SECONDS = 10 * 60
-BATTLE_COOLDOWN_SECONDS = 5 * 60
-BATTLE_ENERGY_MIN = 3
-BATTLE_ENERGY_MAX = 5
 CLAN_TOP_LIMIT = 10
 TOP_LIMIT = 10
 ASTRAL_DRAW_CHANCE = 0.0005
 
-AIRDROP_CYCLE_SECONDS = 20 * 60
 AIRDROP_CHAT_STAGGER_MIN = 5
 AIRDROP_CHAT_STAGGER_MAX = 30
-AIRDROP_EXPIRE_SECONDS = 5 * 60
 AIRDROP_EXPIRE_CHECK_INTERVAL = 30
-AIRDROP_MAX_CLAIMS_PER_CYCLE = 3
-AIRDROP_MIN_MEMBERS = 5
+
+
+# ── Настраиваемые параметры (админка → ⚙️ Настройки) ─────────────────────
+# key -> (раздел, подпись, единица, значение по умолчанию, минимум)
+SETTINGS_SPEC = {
+    "piggy_cooldown_min": ("piggy", "Кулдаун крутки", "мин", 20, 1),
+    "class_cooldown_min": ("class", "Кулдаун крутки", "мин", 1, 1),
+    "class_spin_cost": ("class", "Цена крутки", "монет", 30, 0),
+    "airdrop_cycle_min": ("airdrop", "Интервал появления", "мин", 20, 1),
+    "airdrop_expire_min": ("airdrop", "Время жизни дропа", "мин", 5, 1),
+    "airdrop_max_claims": ("airdrop", "Лимит дропов на игрока за цикл", "шт", 3, 1),
+    "airdrop_min_members": ("airdrop", "Минимум участников в группе", "чел", 5, 0),
+    "energy_max": ("energy", "Максимум энергии", "⚡", 100, 1),
+    "energy_regen_min": ("energy", "Восстановление 1⚡ раз в", "мин", 10, 1),
+    "battle_cooldown_min": ("energy", "Кулдаун боя", "мин", 5, 1),
+    "battle_energy_min": ("energy", "Энергии за бой (от)", "⚡", 3, 0),
+    "battle_energy_max": ("energy", "Энергии за бой (до)", "⚡", 5, 0),
+}
+
+SETTINGS_SECTIONS = {
+    "piggy": "🐷 Копилка",
+    "class": "🎓 Класс",
+    "airdrop": "🎁 Аирдропы",
+    "energy": "⚡ Энергия и бои",
+}
+
+_settings_cache: dict[str, int] = {}
+
+
+def setting(key: str) -> int:
+    """Текущее значение настройки: из кэша, иначе значение по умолчанию."""
+    if key in _settings_cache:
+        return _settings_cache[key]
+    return SETTINGS_SPEC[key][3]
+
+
+async def load_settings(pool: asyncpg.Pool) -> None:
+    rows = await pool.fetch("SELECT key, value FROM settings")
+    _settings_cache.clear()
+    for row in rows:
+        if row["key"] in SETTINGS_SPEC:
+            _settings_cache[row["key"]] = row["value"]
+
+
+async def save_setting(pool: asyncpg.Pool, key: str, value: int) -> None:
+    await pool.execute(
+        """
+        INSERT INTO settings (key, value) VALUES ($1, $2)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """,
+        key, value,
+    )
+    _settings_cache[key] = value
 
 # code -> (название, "1 в N" -> вес выпадения, иконка)
 AIRDROP_TIERS = (
@@ -94,26 +135,32 @@ AIRDROP_LOOT = {
     ],
 }
 
-GROUP_INTRO_TEXT = (
-    "<b>🐦 Angry Копилка\n\n"
-    "Раз в 20 минут можно крутануть копилку и получить силу и монеты.\n"
-    f"За {CLASS_SPIN_COST} монет (раз в минуту) можно крутить класс и получить только силу.\n"
-    "Ответом «кража» или /AngrySteal на чужое сообщение можно украсть монеты (раз в 30 минут).\n"
-    "На энергию (100, восстанавливается 1⚡ раз в 10 минут) можно биться с мобами — /AngryBattle.\n"
-    "Раз в 20 минут в чате падает аирдроп — успей нажать «Забрать» первым!\n\n"
-    "🎰 /AngryOpen — крутануть копилку\n"
-    "🎓 /AngryClass — крутануть класс\n"
-    "🥷 /AngrySteal — украсть монеты (в ответ на сообщение)\n"
-    "⚔️ /AngryBattle — сразиться с мобом (3-5⚡, раз в 5 минут)\n"
-    "ℹ️ /AngryInfo — профиль игрока (в ответ на сообщение)\n"
-    "🏆 /AngryTop — топ силы чата\n\n"
-    f"🏰 /clancreate Название — создать клан ({CLAN_CREATE_COST} монет)\n"
-    "📨 /claninvite — пригласить в клан (в ответ на сообщение)\n"
-    "🚪 /clanleft — выйти из клана\n"
-    "💥 /clandelete — удалить клан (дважды подряд)\n"
-    "🏆 /clantop — топ кланов по силе\n"
-    "ℹ️ /clan [название] — инфо о клане</b>"
-)
+def group_intro_text() -> str:
+    """Строится на лету — цифры берутся из настроек, которые админ может менять."""
+    return (
+        "<b>🐦 Angry Копилка\n\n"
+        f"Раз в {setting('piggy_cooldown_min')} мин можно крутануть копилку и получить силу и монеты.\n"
+        f"За {setting('class_spin_cost')} монет (раз в {setting('class_cooldown_min')} мин) можно "
+        "крутить класс и получить только силу.\n"
+        "Ответом «кража» или /AngrySteal на чужое сообщение можно украсть монеты (раз в 30 минут).\n"
+        f"На энергию ({setting('energy_max')}, восстанавливается 1⚡ раз в "
+        f"{setting('energy_regen_min')} мин) можно биться с мобами — /AngryBattle.\n"
+        f"Раз в {setting('airdrop_cycle_min')} мин в чате падает аирдроп — "
+        "успей нажать «Забрать» первым!\n\n"
+        "🎰 /AngryOpen — крутануть копилку\n"
+        "🎓 /AngryClass — крутануть класс\n"
+        "🥷 /AngrySteal — украсть монеты (в ответ на сообщение)\n"
+        f"⚔️ /AngryBattle — сразиться с мобом ({setting('battle_energy_min')}-"
+        f"{setting('battle_energy_max')}⚡, раз в {setting('battle_cooldown_min')} мин)\n"
+        "ℹ️ /AngryInfo — профиль игрока (в ответ на сообщение)\n"
+        "🏆 /AngryTop — топ силы чата\n\n"
+        f"🏰 /clancreate Название — создать клан ({CLAN_CREATE_COST} монет)\n"
+        "📨 /claninvite — пригласить в клан (в ответ на сообщение)\n"
+        "🚪 /clanleft — выйти из клана\n"
+        "💥 /clandelete — удалить клан (дважды подряд)\n"
+        "🏆 /clantop — топ кланов по силе\n"
+        "ℹ️ /clan [название] — инфо о клане</b>"
+    )
 REFERRAL_HOWTO_TEXT = (
     "<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Как зарабатывать на своей группе\n\n"
     "1. Добавь меня в свою группу (кнопка ниже).\n"
@@ -413,6 +460,12 @@ SCHEMA_STATEMENTS = (
         expired BOOLEAN NOT NULL DEFAULT FALSE
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value BIGINT NOT NULL
+    )
+    """,
 )
 
 
@@ -525,7 +578,7 @@ async def try_claim_airdrop_slot(conn: asyncpg.Connection, user_id: int, name: s
         user_id,
     )
     claims = row["airdrop_cycle_claims"] if row and row["airdrop_cycle_id"] == cycle_id else 0
-    if claims >= AIRDROP_MAX_CLAIMS_PER_CYCLE:
+    if claims >= setting("airdrop_max_claims"):
         return False
     await conn.execute(
         """
@@ -899,16 +952,17 @@ async def draw_random_class_card(conn: asyncpg.Connection) -> dict | None:
 
 
 def _regen_energy(energy: int, updated_at: float, now: float) -> tuple[int, float]:
-    regenerated = int((now - updated_at) // ENERGY_REGEN_SECONDS)
+    regen_seconds = setting("energy_regen_min") * 60
+    regenerated = int((now - updated_at) // regen_seconds)
     if regenerated <= 0:
         return energy, updated_at
-    return min(ENERGY_MAX, energy + regenerated), updated_at + regenerated * ENERGY_REGEN_SECONDS
+    return min(setting("energy_max"), energy + regenerated), updated_at + regenerated * regen_seconds
 
 
 async def get_player_energy_display(pool: asyncpg.Pool, user_id: int) -> int:
     row = await pool.fetchrow("SELECT energy, energy_updated_at FROM players WHERE user_id = $1", user_id)
     if not row:
-        return ENERGY_MAX
+        return setting("energy_max")
     energy, _ = _regen_energy(row["energy"], row["energy_updated_at"], time.time())
     return energy
 
@@ -1170,6 +1224,10 @@ class EditMob(StatesGroup):
     waiting_value = State()
 
 
+class EditSetting(StatesGroup):
+    waiting_value = State()
+
+
 # ── Клавиатуры ───────────────────────────────────────────────────────────
 
 def admin_menu_text() -> str:
@@ -1184,8 +1242,39 @@ def admin_menu_kb():
     kb.button(text="🌐 Все группы", callback_data="chats:menu")
     kb.button(text="📣 Разослать рекламу", callback_data="admin:promo")
     kb.button(text="🎁 Запустить аирдроп", callback_data="admin:airdrop")
+    kb.button(text="⚙️ Настройки", callback_data="settings:menu")
     kb.adjust(1)
     return kb.as_markup()
+
+
+def settings_menu_kb():
+    kb = InlineKeyboardBuilder()
+    for section, label in SETTINGS_SECTIONS.items():
+        kb.button(text=label, callback_data=f"settings:section:{section}")
+    kb.button(text="⬅️ Назад", callback_data="admin:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def settings_section_kb(section: str):
+    kb = InlineKeyboardBuilder()
+    for key, (sect, label, unit, _default, _minimum) in SETTINGS_SPEC.items():
+        if sect == section:
+            kb.button(text=f"{label}: {setting(key)} {unit}", callback_data=f"settings:edit:{key}")
+    kb.button(text="⬅️ Назад", callback_data="settings:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def settings_section_text(section: str) -> str:
+    lines = [f"<b>{SETTINGS_SECTIONS[section]} — настройки</b>", ""]
+    for key, (sect, label, unit, default, _minimum) in SETTINGS_SPEC.items():
+        if sect == section:
+            mark = "" if setting(key) == default else f" (по умолчанию {default})"
+            lines.append(f"<b>{label}:</b> {setting(key)} {unit}{mark}")
+    lines.append("")
+    lines.append("Нажми на параметр, чтобы изменить.")
+    return "\n".join(lines)
 
 
 def chats_list_kb(chats: list[dict]):
@@ -1349,7 +1438,7 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
                 "SELECT last_open FROM players WHERE user_id = $1 FOR UPDATE", user.id
             )
             last_open = player_row["last_open"] if player_row else 0
-            remaining = COOLDOWN_SECONDS - (now - last_open)
+            remaining = setting("piggy_cooldown_min") * 60 - (now - last_open)
             if remaining > 0:
                 minutes, seconds = divmod(int(remaining), 60)
                 return None, f"<b>⏳ Копилка ещё не наполнилась. Попробуй через {minutes} мин {seconds} сек.</b>"
@@ -1414,13 +1503,13 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | N
             )
             last_class = player_row["last_class"] if player_row else 0
 
-            remaining = CLASS_COOLDOWN_SECONDS - (now - last_class)
+            remaining = setting("class_cooldown_min") * 60 - (now - last_class)
             if remaining > 0:
                 minutes, seconds = divmod(int(remaining), 60)
                 return None, f"<b>⏳ Класс ещё не готов. Попробуй через {minutes} мин {seconds} сек.</b>"
 
-            if balance < CLASS_SPIN_COST:
-                return None, f"<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Не хватает монет. Нужно {CLASS_SPIN_COST}, у тебя {balance}.</b>"
+            if balance < setting("class_spin_cost"):
+                return None, f"<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Не хватает монет. Нужно {setting('class_spin_cost')}, у тебя {balance}.</b>"
 
             await conn.execute(
                 """
@@ -1430,7 +1519,7 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | N
                     name = EXCLUDED.name,
                     money = chat_profiles.money + EXCLUDED.money
                 """,
-                chat_id, user.id, user.full_name, -CLASS_SPIN_COST,
+                chat_id, user.id, user.full_name, -setting("class_spin_cost"),
             )
             await add_player_power(conn, user.id, user.full_name, card["power"])
             await set_player_cooldown(conn, user.id, user.full_name, "last_class", now)
@@ -1441,7 +1530,7 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | N
         f"🃏 {card_title(card)}</b>\n"
         f"{rarity_display(card['rarity'])}\n\n"
         f"<b>⚔️ +{card['power']} силы\n"
-        f"<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> −{CLASS_SPIN_COST} монет</b>"
+        f"<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> −{setting('class_spin_cost')} монет</b>"
     )
     return card["photo_id"], caption
 
@@ -1536,7 +1625,7 @@ async def perform_battle(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | 
                 user.id,
             )
 
-            remaining = BATTLE_COOLDOWN_SECONDS - (now - row["last_battle"])
+            remaining = setting("battle_cooldown_min") * 60 - (now - row["last_battle"])
             if remaining > 0:
                 minutes, seconds = divmod(int(remaining), 60)
                 return None, f"<b>⏳ Бой ещё не готов. Попробуй через {minutes} мин {seconds} сек.</b>"
@@ -1546,10 +1635,10 @@ async def perform_battle(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | 
                 return None, "<b>🐗 Мобы ещё не добавлены — админ пока не заселил арену.</b>"
 
             energy, energy_updated_at = _regen_energy(row["energy"], row["energy_updated_at"], now)
-            cost = random.randint(BATTLE_ENERGY_MIN, BATTLE_ENERGY_MAX)
+            cost = random.randint(setting("battle_energy_min"), setting("battle_energy_max"))
             if energy < cost:
                 return None, (
-                    f"<b>🔋 Не хватает энергии. Нужно {cost}, у тебя {energy}/{ENERGY_MAX}.\n"
+                    f"<b>🔋 Не хватает энергии. Нужно {cost}, у тебя {energy}/{setting('energy_max')}.\n"
                     "Восстанавливается 1⚡ раз в 10 минут.</b>"
                 )
             energy -= cost
@@ -1582,12 +1671,12 @@ async def perform_battle(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | 
         caption = (
             f"<b>⚔️ {mention} сразился с «{mob_name}» и одержал победу!\n\n"
             f"<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Награда: {mob['money']} монет\n"
-            f"🔋 Потрачено энергии: {cost} (осталось {energy}/{ENERGY_MAX})</b>"
+            f"🔋 Потрачено энергии: {cost} (осталось {energy}/{setting('energy_max')})</b>"
         )
     else:
         caption = (
             f"<b>💀 {mention} сразился с «{mob_name}» и проиграл...\n\n"
-            f"🔋 Потрачено энергии: {cost} (осталось {energy}/{ENERGY_MAX})</b>"
+            f"🔋 Потрачено энергии: {cost} (осталось {energy}/{setting('energy_max')})</b>"
         )
     return mob["photo_id"], caption
 
@@ -1706,6 +1795,72 @@ async def admin_airdrop_cb(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool
         f"{AIRDROP_CHAT_STAGGER_MIN}-{AIRDROP_CHAT_STAGGER_MAX} сек."
     )
     spawn_background_task(spawn_airdrop_cycle(bot, pool))
+
+
+@router.callback_query(F.data == "settings:menu", IsAdminPrivate())
+async def settings_menu_cb(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_edit_text(
+        callback.message,
+        "<b>⚙️ Настройки</b>\n\nВыбери раздел, чтобы изменить параметры игры.",
+        reply_markup=settings_menu_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("settings:section:"), IsAdminPrivate())
+async def settings_section_cb(callback: CallbackQuery, state: FSMContext):
+    section = callback.data.split(":")[2]
+    if section not in SETTINGS_SECTIONS:
+        await callback.answer("Неизвестный раздел", show_alert=True)
+        return
+    await state.clear()
+    await safe_edit_text(
+        callback.message, settings_section_text(section), reply_markup=settings_section_kb(section)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("settings:edit:"), IsAdminPrivate())
+async def settings_edit_cb(callback: CallbackQuery, state: FSMContext):
+    key = callback.data.split(":")[2]
+    if key not in SETTINGS_SPEC:
+        await callback.answer("Неизвестный параметр", show_alert=True)
+        return
+    section, label, unit, default, minimum = SETTINGS_SPEC[key]
+    await state.set_state(EditSetting.waiting_value)
+    await state.update_data(setting_key=key)
+    await safe_edit_text(
+        callback.message,
+        f"<b>{label}</b>\n\n"
+        f"Сейчас: {setting(key)} {unit}\n"
+        f"По умолчанию: {default} {unit}\n"
+        f"Минимум: {minimum}\n\n"
+        f"Введи новое значение ({unit}):",
+        reply_markup=cancel_kb(f"settings:section:{section}"),
+    )
+    await callback.answer()
+
+
+@router.message(EditSetting.waiting_value, IsAdminPrivate())
+async def settings_edit_value(message: Message, state: FSMContext, pool: asyncpg.Pool):
+    data = await state.get_data()
+    key = data["setting_key"]
+    section, label, unit, _default, minimum = SETTINGS_SPEC[key]
+
+    try:
+        value = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("<b>Нужно целое число, попробуй ещё раз.</b>")
+        return
+    if value < minimum:
+        await message.answer(f"<b>Значение не может быть меньше {minimum}. Попробуй ещё раз.</b>")
+        return
+
+    await save_setting(pool, key, value)
+    await state.clear()
+    await message.answer(f"<b>✅ {label}: {value} {unit}</b>")
+    await message.answer(settings_section_text(section), reply_markup=settings_section_kb(section))
 
 
 @router.callback_query(F.data.startswith("chats:info:"), IsAdminPrivate())
@@ -2425,7 +2580,7 @@ def render_profile(
         f"<b>⚔️ Сила:</b> {power}",
         f"<b><tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji> Монет:</b> {money}",
         f"<b><tg-emoji emoji-id='5233482504182212210'>🐟</tg-emoji> Токенов:</b> {tokens}",
-        f"<b>🔋 Энергия:</b> {energy}/{ENERGY_MAX}",
+        f"<b>🔋 Энергия:</b> {energy}/{setting('energy_max')}",
         f"<b>🏰 Клан:</b> {html.escape(clan_name) if clan_name else 'нет'}",
     ]
     return "\n".join(lines)
@@ -2474,7 +2629,7 @@ GROUP_CALLBACKS = F.message.chat.type.in_({"group", "supergroup"})
 
 @router.message(CommandStart(), GROUP_CHATS)
 async def cmd_start_group(message: Message):
-    await message.reply(GROUP_INTRO_TEXT, reply_markup=group_menu_kb())
+    await message.reply(group_intro_text(), reply_markup=group_menu_kb())
 
 
 @router.message(Command("angryopen", ignore_case=True), GROUP_CHATS)
@@ -2615,7 +2770,7 @@ async def cb_group_top(callback: CallbackQuery, pool: asyncpg.Pool):
 async def airdrop_claim_cb(callback: CallbackQuery, pool: asyncpg.Pool):
     airdrop_id = int(callback.data.split(":")[2])
     user = callback.from_user
-    cycle_id = int(time.time() // AIRDROP_CYCLE_SECONDS)
+    cycle_id = int(time.time() // (setting("airdrop_cycle_min") * 60))
 
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -2630,7 +2785,7 @@ async def airdrop_claim_cb(callback: CallbackQuery, pool: asyncpg.Pool):
             allowed = await try_claim_airdrop_slot(conn, user.id, user.full_name, cycle_id)
             if not allowed:
                 await callback.answer(
-                    f"Лимит {AIRDROP_MAX_CLAIMS_PER_CYCLE} дропов за цикл исчерпан", show_alert=True
+                    f"Лимит {setting('airdrop_max_claims')} дропов за цикл исчерпан", show_alert=True
                 )
                 return
 
@@ -2983,10 +3138,10 @@ async def spawn_airdrop_in_chat(bot: Bot, pool: asyncpg.Pool, chat_id: int, chat
     await asyncio.sleep(random.uniform(AIRDROP_CHAT_STAGGER_MIN, AIRDROP_CHAT_STAGGER_MAX))
 
     members = await count_human_members(bot, chat_id)
-    if members is not None and members < AIRDROP_MIN_MEMBERS:
+    if members is not None and members < setting("airdrop_min_members"):
         logging.info(
             "Аирдроп пропущен: в чате %s (%s) только %s участник(ов), нужно %s",
-            chat_id, chat_title, members, AIRDROP_MIN_MEMBERS,
+            chat_id, chat_title, members, setting("airdrop_min_members"),
         )
         return
 
@@ -3025,7 +3180,7 @@ async def spawn_airdrop_cycle(bot: Bot, pool: asyncpg.Pool) -> None:
 
 async def airdrop_spawn_loop(bot: Bot, pool: asyncpg.Pool) -> None:
     while True:
-        await asyncio.sleep(AIRDROP_CYCLE_SECONDS)
+        await asyncio.sleep(setting("airdrop_cycle_min") * 60)
         try:
             await spawn_airdrop_cycle(bot, pool)
         except Exception:
@@ -3042,7 +3197,7 @@ async def expire_airdrops_loop(bot: Bot, pool: asyncpg.Pool) -> None:
 
 
 async def _expire_airdrops_once(bot: Bot, pool: asyncpg.Pool) -> None:
-    cutoff = time.time() - AIRDROP_EXPIRE_SECONDS
+    cutoff = time.time() - setting("airdrop_expire_min") * 60
     rows = await pool.fetch(
         "SELECT id, chat_id, message_id FROM airdrops "
         "WHERE claimed_by IS NULL AND expired = FALSE AND created_at < $1",
@@ -3116,6 +3271,7 @@ async def main() -> None:
 
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5)
     await init_db(pool)
+    await load_settings(pool)
     try:
         bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         dp = Dispatcher(storage=MemoryStorage())
