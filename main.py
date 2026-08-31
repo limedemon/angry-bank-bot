@@ -443,6 +443,50 @@ async def get_active_chat_ids(pool: asyncpg.Pool) -> list[int]:
     return [row["chat_id"] for row in rows]
 
 
+async def get_active_chats(pool: asyncpg.Pool) -> list[dict]:
+    rows = await pool.fetch("SELECT chat_id, title FROM bot_chats ORDER BY title")
+    return [dict(row) for row in rows]
+
+
+def group_link(chat_id: int) -> str | None:
+    s = str(chat_id)
+    if s.startswith("-100"):
+        return f"https://t.me/c/{s[4:]}"
+    return None
+
+
+def group_message_link(chat_id: int, message_id: int) -> str | None:
+    base = group_link(chat_id)
+    return f"{base}/{message_id}" if base else None
+
+
+async def notify_admin(bot: Bot, pool: asyncpg.Pool, text: str) -> None:
+    admin_id = await get_admin_id(pool)
+    if admin_id is None:
+        return
+    try:
+        await bot.send_message(admin_id, text)
+    except TelegramAPIError as error:
+        logging.warning("Не удалось отправить админ-уведомление: %s", error)
+
+
+async def notify_admin_broadcast_results(
+    bot: Bot, pool: asyncpg.Pool, title: str, results: list[tuple]
+) -> None:
+    if not results:
+        return
+    lines = [f"<b>{title} — рассылка ({len(results)} чат(ов))</b>", ""]
+    for chat_title, link, ok in results:
+        safe_title = html.escape(chat_title)
+        if not ok:
+            lines.append(f"❌ {safe_title} — не отправлено")
+        elif link:
+            lines.append(f"✅ <a href='{link}'>{safe_title}</a>")
+        else:
+            lines.append(f"✅ {safe_title} (ссылка недоступна для этого типа чата)")
+    await notify_admin(bot, pool, "\n".join(lines))
+
+
 # ── Аирдропы ─────────────────────────────────────────────────────────────
 
 def roll_airdrop_tier() -> tuple[str, str, str]:
@@ -1037,6 +1081,12 @@ class OwnerNotifyMiddleware(BaseMiddleware):
                 except TelegramForbiddenError:
                     continue
                 await mark_owner_notified(pool, chat["chat_id"])
+                await notify_admin(
+                    bot, pool,
+                    f"<b>👑 Отложенное уведомление о 1% доставлено</b>\n"
+                    f"Группа: {html.escape(chat['chat_title'])}\n"
+                    f"Владелец: {html.escape(event.from_user.full_name)}",
+                )
         return await handler(event, data)
 
 
@@ -1098,6 +1148,20 @@ def admin_menu_kb():
     kb.button(text="🐷 Копилка", callback_data="piggy:menu")
     kb.button(text="🎓 Класс", callback_data="class:menu")
     kb.button(text="🐗 Мобы", callback_data="mob:menu")
+    kb.button(text="🌐 Все группы", callback_data="chats:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def chats_list_kb(chats: list[dict]):
+    kb = InlineKeyboardBuilder()
+    for chat in chats:
+        link = group_link(chat["chat_id"])
+        if link:
+            kb.button(text=chat["title"], url=link)
+        else:
+            kb.button(text=chat["title"], callback_data=f"chats:info:{chat['chat_id']}")
+    kb.button(text="⬅️ Назад", callback_data="admin:menu")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -1553,6 +1617,29 @@ async def cmd_start_private(message: Message, command: CommandObject, state: FSM
 async def admin_menu_cb(callback: CallbackQuery):
     await safe_edit_text(callback.message, admin_menu_text(), reply_markup=admin_menu_kb())
     await callback.answer()
+
+
+@router.callback_query(F.data == "chats:menu", IsAdminPrivate())
+async def chats_menu_cb(callback: CallbackQuery, pool: asyncpg.Pool):
+    chats = await get_active_chats(pool)
+    if not chats:
+        await callback.answer("Бот пока не состоит ни в одной группе", show_alert=True)
+        return
+    await safe_edit_text(
+        callback.message,
+        f"<b>🌐 Группы бота ({len(chats)})</b>\n\nНажми на группу, чтобы перейти в неё.",
+        reply_markup=chats_list_kb(chats),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("chats:info:"), IsAdminPrivate())
+async def chats_info_cb(callback: CallbackQuery):
+    chat_id = callback.data.split(":")[2]
+    await callback.answer(
+        f"ID чата: {chat_id}\n(обычная группа — прямая ссылка недоступна, только супергруппы)",
+        show_alert=True,
+    )
 
 
 @router.callback_query(F.data == "piggy:menu", IsAdminPrivate())
@@ -2718,8 +2805,19 @@ async def on_bot_membership_change(event: ChatMemberUpdated, bot: Bot, pool: asy
     try:
         await bot.send_message(owner_id, owner_notify_text(title))
     except TelegramForbiddenError:
+        await notify_admin(
+            bot, pool,
+            f"<b>👑 Уведомление о 1% НЕ доставлено</b>\n"
+            f"Группа: {html.escape(title)}\n"
+            f"Владелец ещё не писал боту в ЛС — уведомление встало в очередь на потом.",
+        )
         return
     await mark_owner_notified(pool, event.chat.id)
+    await notify_admin(
+        bot, pool,
+        f"<b>👑 Уведомление о 1% доставлено сразу</b>\n"
+        f"Группа: {html.escape(title)}\nВладелец: {html.escape(owner_name)}",
+    )
 
 
 # ── Лог обновлений ───────────────────────────────────────────────────────
@@ -2784,11 +2882,15 @@ def referral_promo_kb(bot_username: str):
 
 async def broadcast_referral_promo(bot: Bot, pool: asyncpg.Pool, bot_username: str) -> None:
     kb = referral_promo_kb(bot_username)
-    for chat_id in await get_active_chat_ids(pool):
+    results = []
+    for chat in await get_active_chats(pool):
         try:
-            await bot.send_message(chat_id, REFERRAL_PROMO_TEXT, reply_markup=kb)
+            sent = await bot.send_message(chat["chat_id"], REFERRAL_PROMO_TEXT, reply_markup=kb)
+            results.append((chat["title"], group_message_link(chat["chat_id"], sent.message_id), True))
         except TelegramAPIError as error:
-            logging.warning("Не удалось отправить промо в чат %s: %s", chat_id, error)
+            logging.warning("Не удалось отправить промо в чат %s: %s", chat["chat_id"], error)
+            results.append((chat["title"], None, False))
+    await notify_admin_broadcast_results(bot, pool, "🎁 Промо 1%", results)
 
 
 async def referral_promo_loop(bot: Bot, pool: asyncpg.Pool, bot_username: str) -> None:
@@ -2810,7 +2912,7 @@ def airdrop_claim_kb(airdrop_id: int):
     return kb.as_markup()
 
 
-async def spawn_airdrop_in_chat(bot: Bot, pool: asyncpg.Pool, chat_id: int) -> None:
+async def spawn_airdrop_in_chat(bot: Bot, pool: asyncpg.Pool, chat_id: int, chat_title: str) -> None:
     await asyncio.sleep(random.uniform(AIRDROP_CHAT_STAGGER_MIN, AIRDROP_CHAT_STAGGER_MAX))
     code, label, icon = roll_airdrop_tier()
     airdrop_id = await pool.fetchval(
@@ -2824,13 +2926,25 @@ async def spawn_airdrop_in_chat(bot: Bot, pool: asyncpg.Pool, chat_id: int) -> N
     except TelegramAPIError as error:
         logging.warning("Не удалось отправить аирдроп в чат %s: %s", chat_id, error)
         await pool.execute("DELETE FROM airdrops WHERE id = $1", airdrop_id)
+        await notify_admin(
+            bot, pool,
+            f"<b>🌌 Аирдроп НЕ отправлен</b>\n{label} · {html.escape(chat_title)}\nОшибка: {html.escape(str(error))}",
+        )
         return
     await pool.execute("UPDATE airdrops SET message_id = $1 WHERE id = $2", sent.message_id, airdrop_id)
 
+    link = group_message_link(chat_id, sent.message_id)
+    safe_title = html.escape(chat_title)
+    if link:
+        text = f"<b>🌌 Аирдроп отправлен</b>\n{label} · <a href='{link}'>{safe_title}</a>"
+    else:
+        text = f"<b>🌌 Аирдроп отправлен</b>\n{label} · {safe_title} (ссылка недоступна для этого типа чата)"
+    await notify_admin(bot, pool, text)
+
 
 async def spawn_airdrop_cycle(bot: Bot, pool: asyncpg.Pool) -> None:
-    for chat_id in await get_active_chat_ids(pool):
-        asyncio.create_task(spawn_airdrop_in_chat(bot, pool, chat_id))
+    for chat in await get_active_chats(pool):
+        asyncio.create_task(spawn_airdrop_in_chat(bot, pool, chat["chat_id"], chat["title"]))
 
 
 async def airdrop_spawn_loop(bot: Bot, pool: asyncpg.Pool) -> None:
