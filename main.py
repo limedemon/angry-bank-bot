@@ -48,13 +48,61 @@ BATTLE_ENERGY_MIN = 3
 BATTLE_ENERGY_MAX = 5
 CLAN_TOP_LIMIT = 10
 TOP_LIMIT = 10
+ASTRAL_DRAW_CHANCE = 0.0005
+
+AIRDROP_CYCLE_SECONDS = 20 * 60
+AIRDROP_CHAT_STAGGER_MIN = 5
+AIRDROP_CHAT_STAGGER_MAX = 30
+AIRDROP_EXPIRE_SECONDS = 5 * 60
+AIRDROP_EXPIRE_CHECK_INTERVAL = 30
+AIRDROP_MAX_CLAIMS_PER_CYCLE = 3
+
+# code -> (название, "1 в N" -> вес выпадения, иконка)
+AIRDROP_TIERS = (
+    ("common", "Обычный", 1 / 2, "📦"),
+    ("uncommon", "Необычный", 1 / 5, "🎁"),
+    ("rare", "Редкий", 1 / 10, "💎"),
+    ("epic", "Эпический", 1 / 20, "🔮"),
+    ("legendary", "Легендарный", 1 / 100, "🌟"),
+    ("mythic", "Мифический", 1 / 300, "🔥"),
+    ("astral", "Астральный", 1 / 1000, "🌌"),
+)
+AIRDROP_TIER_LABELS = {code: label for code, label, _, _ in AIRDROP_TIERS}
+AIRDROP_TIER_ICONS = {code: icon for code, _, _, icon in AIRDROP_TIERS}
+
+# тип строки -> (мин, макс, шанс попадания строки в дроп)
+AIRDROP_LOOT = {
+    "common": [("power", 1, 10, 0.40), ("money", 1, 5, 0.40)],
+    "uncommon": [("power", 5, 15, 0.40), ("money", 5, 10, 0.40)],
+    "rare": [("power", 20, 30, 0.40), ("money", 10, 20, 0.40)],
+    "epic": [("power", 30, 40, 0.70), ("money", 20, 40, 0.50)],
+    "legendary": [
+        ("power", 40, 60, 0.70),
+        ("money", 40, 60, 0.50),
+        ("tokens", 1, 1, 0.01),
+        ("astral", 0, 0, 0.001),
+    ],
+    "mythic": [
+        ("power", 60, 100, 1.00),
+        ("money", 60, 100, 0.50),
+        ("tokens", 1, 2, 0.01),
+        ("astral", 0, 0, 0.01),
+    ],
+    "astral": [
+        ("power", 100, 150, 1.00),
+        ("money", 100, 200, 0.50),
+        ("tokens", 2, 4, 1.00),
+        ("astral", 0, 0, 0.10),
+    ],
+}
 
 GROUP_INTRO_TEXT = (
     "<b>🐦 Angry Копилка\n\n"
     "Раз в 20 минут можно крутануть копилку и получить силу и монеты.\n"
     f"За {CLASS_SPIN_COST} монет (раз в минуту) можно крутить класс и получить только силу.\n"
     "Ответом «кража» или /AngrySteal на чужое сообщение можно украсть монеты (раз в 30 минут).\n"
-    "На энергию (100, восстанавливается 1⚡ раз в 10 минут) можно биться с мобами — /AngryBattle.\n\n"
+    "На энергию (100, восстанавливается 1⚡ раз в 10 минут) можно биться с мобами — /AngryBattle.\n"
+    "Раз в 20 минут в чате падает аирдроп — успей нажать «Забрать» первым!\n\n"
     "🎰 /AngryOpen — крутануть копилку\n"
     "🎓 /AngryClass — крутануть класс\n"
     "🥷 /AngrySteal — украсть монеты (в ответ на сообщение)\n"
@@ -106,6 +154,7 @@ MOB_FIELD_PROMPTS = {
 
 REGULAR_STAR_EMOJI_ID = "5224378646688474051"
 RAINBOW_STAR_EMOJI_ID = "5224307204202476701"
+ASTRAL_STAR_EMOJI_ID = "5233626046284212790"
 
 # rarity code -> (кол-во звёзд, тип звезды)
 RARITY_INFO = {
@@ -113,17 +162,26 @@ RARITY_INFO = {
     2: (2, "regular"),
     3: (3, "regular"),
     4: (3, "rainbow"),
+    5: (3, "astral"),
 }
 RARITY_PICK_BUTTONS = (
     (1, "⭐"),
     (2, "⭐⭐"),
     (3, "⭐⭐⭐"),
     (4, "🌈⭐⭐⭐"),
+    (5, "✨⭐⭐⭐"),
 )
 
 
+STAR_EMOJI_IDS = {
+    "regular": REGULAR_STAR_EMOJI_ID,
+    "rainbow": RAINBOW_STAR_EMOJI_ID,
+    "astral": ASTRAL_STAR_EMOJI_ID,
+}
+
+
 def stars_html(count: int, kind: str) -> str:
-    emoji_id = RAINBOW_STAR_EMOJI_ID if kind == "rainbow" else REGULAR_STAR_EMOJI_ID
+    emoji_id = STAR_EMOJI_IDS.get(kind, REGULAR_STAR_EMOJI_ID)
     star = f'<tg-emoji emoji-id="{emoji_id}">⭐️</tg-emoji>'
     return star * count
 
@@ -138,7 +196,7 @@ def rarity_pick_kb(callback_prefix: str, back_callback: str):
     for code, label in RARITY_PICK_BUTTONS:
         kb.button(text=label, callback_data=f"{callback_prefix}:{code}")
     kb.button(text="⬅️ Назад", callback_data=back_callback)
-    kb.adjust(4, 1)
+    kb.adjust(3, 2, 1)
     return kb.as_markup()
 
 
@@ -249,6 +307,14 @@ SCHEMA_STATEMENTS = (
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_card_power BIGINT",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_card_rarity SMALLINT",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_card_bird SMALLINT",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_class_name TEXT",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_class_photo_id TEXT",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_class_power BIGINT",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_class_rarity SMALLINT",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_class_bird SMALLINT",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS tokens BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS airdrop_cycle_id BIGINT NOT NULL DEFAULT 0",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS airdrop_cycle_claims INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS last_open DOUBLE PRECISION NOT NULL DEFAULT 0",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS last_class DOUBLE PRECISION NOT NULL DEFAULT 0",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS energy INTEGER NOT NULL DEFAULT 100",
@@ -333,6 +399,18 @@ SCHEMA_STATEMENTS = (
         title TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS airdrops (
+        id SERIAL PRIMARY KEY,
+        chat_id BIGINT NOT NULL,
+        message_id BIGINT NOT NULL,
+        tier TEXT NOT NULL,
+        created_at DOUBLE PRECISION NOT NULL,
+        claimed_by BIGINT,
+        claimed_name TEXT,
+        expired BOOLEAN NOT NULL DEFAULT FALSE
+    )
+    """,
 )
 
 
@@ -363,6 +441,126 @@ async def set_last_deploy_version(pool: asyncpg.Pool, version: str) -> None:
 async def get_active_chat_ids(pool: asyncpg.Pool) -> list[int]:
     rows = await pool.fetch("SELECT chat_id FROM bot_chats")
     return [row["chat_id"] for row in rows]
+
+
+# ── Аирдропы ─────────────────────────────────────────────────────────────
+
+def roll_airdrop_tier() -> tuple[str, str, str]:
+    codes = [t[0] for t in AIRDROP_TIERS]
+    weights = [t[2] for t in AIRDROP_TIERS]
+    code = random.choices(codes, weights=weights, k=1)[0]
+    return code, AIRDROP_TIER_LABELS[code], AIRDROP_TIER_ICONS[code]
+
+
+def roll_airdrop_loot(tier: str) -> list[tuple]:
+    lines = AIRDROP_LOOT[tier]
+    hits = [line for line in lines if random.random() < line[3]]
+    if not hits:
+        hits = [max(lines, key=lambda line: line[3])]
+    if len(hits) > 5:
+        hits = random.sample(hits, 5)
+    return hits
+
+
+async def try_claim_airdrop_slot(conn: asyncpg.Connection, user_id: int, name: str, cycle_id: int) -> bool:
+    row = await conn.fetchrow(
+        "SELECT airdrop_cycle_id, airdrop_cycle_claims FROM players WHERE user_id = $1 FOR UPDATE",
+        user_id,
+    )
+    claims = row["airdrop_cycle_claims"] if row and row["airdrop_cycle_id"] == cycle_id else 0
+    if claims >= AIRDROP_MAX_CLAIMS_PER_CYCLE:
+        return False
+    await conn.execute(
+        """
+        INSERT INTO players (user_id, name, airdrop_cycle_id, airdrop_cycle_claims)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (user_id) DO UPDATE SET
+            name = EXCLUDED.name,
+            airdrop_cycle_id = EXCLUDED.airdrop_cycle_id,
+            airdrop_cycle_claims = EXCLUDED.airdrop_cycle_claims
+        """,
+        user_id, name, cycle_id, claims + 1,
+    )
+    return True
+
+
+async def apply_airdrop_loot(
+    conn: asyncpg.Connection, chat_id: int, user_id: int, name: str, hits: list[tuple]
+) -> list[str]:
+    lines: list[str] = []
+    for kind, lo, hi, _ in hits:
+        if kind == "power":
+            amount = random.randint(lo, hi)
+            await add_player_power(conn, user_id, name, amount)
+            lines.append(f"⚔️ +{amount} силы")
+        elif kind == "money":
+            amount = random.randint(lo, hi)
+            await conn.execute(
+                """
+                INSERT INTO chat_profiles (chat_id, user_id, name, money, opens)
+                VALUES ($1, $2, $3, $4, 0)
+                ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                    name = EXCLUDED.name, money = chat_profiles.money + EXCLUDED.money
+                """,
+                chat_id, user_id, name, amount,
+            )
+            lines.append(f"💰 +{amount} монет")
+        elif kind == "tokens":
+            amount = random.randint(lo, hi)
+            await add_player_tokens(conn, user_id, name, amount)
+            lines.append(f"🐟 +{amount} токенов")
+        elif kind == "astral":
+            pool_choice = random.choice(("piggy", "class"))
+            if pool_choice == "piggy":
+                card = await conn.fetchrow(
+                    "SELECT name, power, money, photo_id, rarity, bird FROM cards WHERE rarity = 5 ORDER BY random() LIMIT 1"
+                )
+                if card is None:
+                    card = await conn.fetchrow(
+                        "SELECT name, power, photo_id, rarity, bird FROM class_cards WHERE rarity = 5 ORDER BY random() LIMIT 1"
+                    )
+                    if card is not None:
+                        pool_choice = "class"
+            else:
+                card = await conn.fetchrow(
+                    "SELECT name, power, photo_id, rarity, bird FROM class_cards WHERE rarity = 5 ORDER BY random() LIMIT 1"
+                )
+                if card is None:
+                    card = await conn.fetchrow(
+                        "SELECT name, power, money, photo_id, rarity, bird FROM cards WHERE rarity = 5 ORDER BY random() LIMIT 1"
+                    )
+                    if card is not None:
+                        pool_choice = "piggy"
+
+            if card is None:
+                continue
+
+            card = dict(card)
+            await add_player_power(conn, user_id, name, card["power"])
+            if pool_choice == "piggy":
+                await conn.execute(
+                    """
+                    INSERT INTO chat_profiles (chat_id, user_id, name, money, opens)
+                    VALUES ($1, $2, $3, $4, 0)
+                    ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                        name = EXCLUDED.name, money = chat_profiles.money + EXCLUDED.money
+                    """,
+                    chat_id, user_id, name, card["money"],
+                )
+                await maybe_update_best_card(conn, user_id, card)
+                lines.append(
+                    f"🌌 <b>Астральная карточка (копилка): {card_title(card)}</b>\n"
+                    f"{rarity_display(card['rarity'])}\n"
+                    f"   ⚔️ +{card['power']} силы · 💰 +{card['money']} монет"
+                )
+            else:
+                await maybe_update_best_class(conn, user_id, card)
+                lines.append(
+                    f"🌌 <b>Астральная карточка (класс): {card_title(card)}</b>\n"
+                    f"{rarity_display(card['rarity'])}\n"
+                    f"   ⚔️ +{card['power']} силы"
+                )
+    return lines
 
 
 async def list_cards(pool: asyncpg.Pool) -> list[dict]:
@@ -566,6 +764,81 @@ async def get_player_best_card(pool: asyncpg.Pool, user_id: int) -> dict | None:
 async def get_player_power(pool: asyncpg.Pool, user_id: int) -> int:
     power = await pool.fetchval("SELECT power FROM players WHERE user_id = $1", user_id)
     return power or 0
+
+
+async def maybe_update_best_class(conn: asyncpg.Connection, user_id: int, card: dict) -> None:
+    row = await conn.fetchrow(
+        "SELECT best_class_rarity, best_class_power FROM players WHERE user_id = $1", user_id
+    )
+    current_rarity = row["best_class_rarity"] if row else None
+    current_power = row["best_class_power"] if row else None
+    is_better = (
+        current_rarity is None
+        or card["rarity"] > current_rarity
+        or (card["rarity"] == current_rarity and card["power"] > (current_power or 0))
+    )
+    if not is_better:
+        return
+    await conn.execute(
+        """
+        UPDATE players SET
+            best_class_name = $2, best_class_photo_id = $3,
+            best_class_power = $4, best_class_rarity = $5, best_class_bird = $6
+        WHERE user_id = $1
+        """,
+        user_id, card["name"], card["photo_id"], card["power"], card["rarity"], card["bird"],
+    )
+
+
+async def get_player_best_class(pool: asyncpg.Pool, user_id: int) -> dict | None:
+    row = await pool.fetchrow(
+        """
+        SELECT best_class_name AS name, best_class_photo_id AS photo_id,
+               best_class_power AS power, best_class_rarity AS rarity, best_class_bird AS bird
+        FROM players WHERE user_id = $1
+        """,
+        user_id,
+    )
+    if not row or row["photo_id"] is None:
+        return None
+    return dict(row)
+
+
+async def add_player_tokens(conn: asyncpg.Connection, user_id: int, name: str, tokens: int) -> None:
+    await conn.execute(
+        """
+        INSERT INTO players (user_id, name, tokens) VALUES ($1, $2, $3)
+        ON CONFLICT (user_id) DO UPDATE SET name = EXCLUDED.name, tokens = players.tokens + EXCLUDED.tokens
+        """,
+        user_id, name, tokens,
+    )
+
+
+async def get_player_tokens(pool: asyncpg.Pool, user_id: int) -> int:
+    tokens = await pool.fetchval("SELECT tokens FROM players WHERE user_id = $1", user_id)
+    return tokens or 0
+
+
+def _weighted_card_pick(rows: list) -> dict | None:
+    if not rows:
+        return None
+    astral = [r for r in rows if r["rarity"] == 5]
+    normal = [r for r in rows if r["rarity"] != 5]
+    if not normal:
+        return dict(random.choice(astral))
+    if astral and random.random() < ASTRAL_DRAW_CHANCE:
+        return dict(random.choice(astral))
+    return dict(random.choice(normal))
+
+
+async def draw_random_card(conn: asyncpg.Connection) -> dict | None:
+    rows = await conn.fetch("SELECT name, power, money, photo_id, rarity, bird FROM cards")
+    return _weighted_card_pick(rows)
+
+
+async def draw_random_class_card(conn: asyncpg.Connection) -> dict | None:
+    rows = await conn.fetch("SELECT name, power, photo_id, rarity, bird FROM class_cards")
+    return _weighted_card_pick(rows)
 
 
 def _regen_energy(energy: int, updated_at: float, now: float) -> tuple[int, float]:
@@ -969,9 +1242,7 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
     now = time.time()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            card = await conn.fetchrow(
-                "SELECT name, power, money, photo_id, rarity, bird FROM cards ORDER BY random() LIMIT 1"
-            )
+            card = await draw_random_card(conn)
             if card is None:
                 return None, "<b>🕳 Копилка пока пуста — админ ещё не добавил карточки.</b>"
 
@@ -997,7 +1268,7 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | No
             )
             await add_player_power(conn, user.id, user.full_name, card["power"])
             await set_player_cooldown(conn, user.id, user.full_name, "last_open", now)
-            await maybe_update_best_card(conn, user.id, dict(card))
+            await maybe_update_best_card(conn, user.id, card)
 
             # Реферальные 1% владельцу группы — прибавляются прямо к его основным
             # деньгам (не отдельным счётчиком), молча, без уведомлений.
@@ -1029,9 +1300,7 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | N
     now = time.time()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            card = await conn.fetchrow(
-                "SELECT name, power, photo_id, rarity, bird FROM class_cards ORDER BY random() LIMIT 1"
-            )
+            card = await draw_random_class_card(conn)
             if card is None:
                 return None, "<b>🕳 Класс пока пуст — админ ещё не добавил карточки.</b>"
 
@@ -1066,6 +1335,7 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | N
             )
             await add_player_power(conn, user.id, user.full_name, card["power"])
             await set_player_cooldown(conn, user.id, user.full_name, "last_class", now)
+            await maybe_update_best_class(conn, user.id, card)
 
     caption = (
         f"<b>🎓 <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> крутит класс!\n\n"
@@ -1979,31 +2249,51 @@ async def mob_remove_pick(callback: CallbackQuery, pool: asyncpg.Pool):
 
 # — Профиль игрока —
 
-def profile_text(user, summary: dict, energy: int) -> str:
-    if summary["chats"] == 0:
-        return (
-            "<b>👤 Профиль\n\n"
-            "Ты пока не крутил копилку ни в одной группе.\n"
-            "Добавь бота в чат и используй там 🎰 /AngryOpen!</b>"
-        )
-
-    lines = [
-        f"👤 Профиль — {html.escape(user.full_name)}",
+def render_profile(
+    name: str, power: int, money, tokens: int, energy: int, clan_name: str | None, best_class: dict | None
+) -> str:
+    lines = [f"<b>👤 {html.escape(name)}</b>", "━━━━━━━━━━━━━━", ""]
+    if best_class:
+        lines.append(f"<b>🎓 Лучший класс:</b> {card_title(best_class)}")
+        lines.append(rarity_display(best_class["rarity"]))
+    else:
+        lines.append("<b>🎓 Лучший класс:</b> пока нет — крути /AngryClass!")
+    lines += [
         "",
-        f"⚔️ Сила (всего): {summary['power']}",
-        f"💰 Монет (всего): {summary['money']}",
-        f"🔋 Энергия: {energy}/{ENERGY_MAX}",
-        f"🎰 Круток копилки: {summary['opens']}",
-        f"👥 Групп с игрой: {summary['chats']}",
+        f"<b>⚔️ Сила:</b> {power}",
+        f"<b>💰 Монет:</b> {money}",
+        f"<b>🐟 Токенов:</b> {tokens}",
+        f"<b>🔋 Энергия:</b> {energy}/{ENERGY_MAX}",
+        f"<b>🏰 Клан:</b> {html.escape(clan_name) if clan_name else 'нет'}",
     ]
-    return "<b>" + "\n".join(lines) + "</b>"
+    return "\n".join(lines)
 
 
 @router.message(F.chat.type == "private")
 async def show_profile(message: Message, pool: asyncpg.Pool):
-    summary = await get_player_summary(pool, message.from_user.id)
-    energy = await get_player_energy_display(pool, message.from_user.id)
-    await message.answer(profile_text(message.from_user, summary, energy))
+    user = message.from_user
+    summary = await get_player_summary(pool, user.id)
+    if summary["chats"] == 0:
+        await message.answer(
+            "<b>👤 Профиль\n\n"
+            "Ты пока не крутил копилку ни в одной группе.\n"
+            "Добавь бота в чат и используй там 🎰 /AngryOpen!</b>"
+        )
+        return
+
+    tokens = await get_player_tokens(pool, user.id)
+    energy = await get_player_energy_display(pool, user.id)
+    clan = await get_user_clan(pool, user.id)
+    best_class = await get_player_best_class(pool, user.id)
+
+    text = render_profile(
+        user.full_name, summary["power"], summary["money"], tokens, energy,
+        clan["name"] if clan else None, best_class,
+    )
+    if best_class:
+        await message.answer_photo(best_class["photo_id"], caption=text)
+    else:
+        await message.answer(text)
 
 
 # ── Групповые команды ─────────────────────────────────────────────────────
@@ -2073,27 +2363,18 @@ async def cmd_angry_info(message: Message, command: CommandObject, bot: Bot, poo
 
     power = await get_player_power(pool, target_id)
     money = await get_chat_money(pool, message.chat.id, target_id)
+    tokens = await get_player_tokens(pool, target_id)
+    energy = await get_player_energy_display(pool, target_id)
     clan = await get_user_clan(pool, target_id)
-    best_card = await get_player_best_card(pool, target_id)
+    best_class = await get_player_best_class(pool, target_id)
 
-    lines = [f"<b>👤 {html.escape(target_name)}</b>", "━━━━━━━━━━━━━━", ""]
-    if best_card:
-        lines.append(f"<b>🃏 Лучшая карточка:</b> {card_title(best_card)}")
-        lines.append(rarity_display(best_card["rarity"]))
+    text = render_profile(
+        target_name, power, money, tokens, energy, clan["name"] if clan else None, best_class
+    )
+    if best_class:
+        await message.reply_photo(best_class["photo_id"], caption=text)
     else:
-        lines.append("<b>🃏 Лучшая карточка:</b> пока нет — крути /AngryOpen!")
-    lines += [
-        "",
-        f"<b>⚔️ Сила:</b> {power}",
-        f"<b>💰 Монет:</b> {money}",
-        f"<b>🏰 Клан:</b> {html.escape(clan['name']) if clan else 'нет'}",
-    ]
-    caption = "\n".join(lines)
-
-    if best_card:
-        await message.reply_photo(best_card["photo_id"], caption=caption)
-    else:
-        await message.reply(caption)
+        await message.reply(text)
 
 
 async def handle_steal(message: Message, pool: asyncpg.Pool) -> None:
@@ -2157,6 +2438,46 @@ async def cb_group_battle(callback: CallbackQuery, pool: asyncpg.Pool):
 async def cb_group_top(callback: CallbackQuery, pool: asyncpg.Pool):
     await callback.message.reply(await perform_top(pool, callback.message.chat.id))
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("airdrop:claim:"), GROUP_CHATS)
+async def airdrop_claim_cb(callback: CallbackQuery, pool: asyncpg.Pool):
+    airdrop_id = int(callback.data.split(":")[2])
+    user = callback.from_user
+    cycle_id = int(time.time() // AIRDROP_CYCLE_SECONDS)
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT chat_id, tier, claimed_by, expired FROM airdrops WHERE id = $1 FOR UPDATE",
+                airdrop_id,
+            )
+            if row is None or row["claimed_by"] is not None or row["expired"]:
+                await callback.answer("Этот дроп уже забрали или он исчез", show_alert=True)
+                return
+
+            allowed = await try_claim_airdrop_slot(conn, user.id, user.full_name, cycle_id)
+            if not allowed:
+                await callback.answer(
+                    f"Лимит {AIRDROP_MAX_CLAIMS_PER_CYCLE} дропов за цикл исчерпан", show_alert=True
+                )
+                return
+
+            loot_lines = await apply_airdrop_loot(
+                conn, row["chat_id"], user.id, user.full_name, roll_airdrop_loot(row["tier"])
+            )
+
+            await conn.execute(
+                "UPDATE airdrops SET claimed_by = $1, claimed_name = $2 WHERE id = $3",
+                user.id, user.full_name, airdrop_id,
+            )
+
+    label = AIRDROP_TIER_LABELS[row["tier"]]
+    icon = AIRDROP_TIER_ICONS[row["tier"]]
+    mention = f"<a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a>"
+    text = f"<b>{icon} {mention} забрал {label.lower()} дроп!</b>\n\n" + "\n".join(loot_lines)
+    await safe_edit_text(callback.message, text)
+    await callback.answer("Забрано!")
 
 
 # ── Кланы ─────────────────────────────────────────────────────────────────
@@ -2476,6 +2797,68 @@ async def referral_promo_loop(bot: Bot, pool: asyncpg.Pool, bot_username: str) -
         await broadcast_referral_promo(bot, pool, bot_username)
 
 
+# ── Планировщик аирдропов ────────────────────────────────────────────────
+
+def airdrop_spawn_text(label: str, icon: str) -> str:
+    return f"<b>{icon} Появился {label.lower()} аирдроп!</b>"
+
+
+def airdrop_claim_kb(airdrop_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎁 Забрать", callback_data=f"airdrop:claim:{airdrop_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def spawn_airdrop_in_chat(bot: Bot, pool: asyncpg.Pool, chat_id: int) -> None:
+    await asyncio.sleep(random.uniform(AIRDROP_CHAT_STAGGER_MIN, AIRDROP_CHAT_STAGGER_MAX))
+    code, label, icon = roll_airdrop_tier()
+    airdrop_id = await pool.fetchval(
+        "INSERT INTO airdrops (chat_id, message_id, tier, created_at) VALUES ($1, 0, $2, $3) RETURNING id",
+        chat_id, code, time.time(),
+    )
+    try:
+        sent = await bot.send_message(
+            chat_id, airdrop_spawn_text(label, icon), reply_markup=airdrop_claim_kb(airdrop_id)
+        )
+    except TelegramAPIError as error:
+        logging.warning("Не удалось отправить аирдроп в чат %s: %s", chat_id, error)
+        await pool.execute("DELETE FROM airdrops WHERE id = $1", airdrop_id)
+        return
+    await pool.execute("UPDATE airdrops SET message_id = $1 WHERE id = $2", sent.message_id, airdrop_id)
+
+
+async def spawn_airdrop_cycle(bot: Bot, pool: asyncpg.Pool) -> None:
+    for chat_id in await get_active_chat_ids(pool):
+        asyncio.create_task(spawn_airdrop_in_chat(bot, pool, chat_id))
+
+
+async def airdrop_spawn_loop(bot: Bot, pool: asyncpg.Pool) -> None:
+    while True:
+        await asyncio.sleep(AIRDROP_CYCLE_SECONDS)
+        await spawn_airdrop_cycle(bot, pool)
+
+
+async def expire_airdrops_loop(bot: Bot, pool: asyncpg.Pool) -> None:
+    while True:
+        await asyncio.sleep(AIRDROP_EXPIRE_CHECK_INTERVAL)
+        cutoff = time.time() - AIRDROP_EXPIRE_SECONDS
+        rows = await pool.fetch(
+            "SELECT id, chat_id, message_id FROM airdrops "
+            "WHERE claimed_by IS NULL AND expired = FALSE AND created_at < $1",
+            cutoff,
+        )
+        for row in rows:
+            await pool.execute("UPDATE airdrops SET expired = TRUE WHERE id = $1", row["id"])
+            try:
+                await bot.edit_message_text(
+                    "<b>💨 Аирдроп исчез — никто не успел его забрать.</b>",
+                    chat_id=row["chat_id"], message_id=row["message_id"],
+                )
+            except TelegramAPIError:
+                pass
+
+
 # ── Запуск ───────────────────────────────────────────────────────────────
 
 async def set_bot_commands(bot: Bot) -> None:
@@ -2530,6 +2913,8 @@ async def main() -> None:
 
         me = await bot.get_me()
         asyncio.create_task(referral_promo_loop(bot, pool, me.username))
+        asyncio.create_task(airdrop_spawn_loop(bot, pool))
+        asyncio.create_task(expire_airdrops_loop(bot, pool))
 
         await dp.start_polling(bot, pool=pool)
     finally:
