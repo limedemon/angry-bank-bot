@@ -44,6 +44,11 @@ AIRDROP_CHAT_STAGGER_MIN = 5
 AIRDROP_CHAT_STAGGER_MAX = 30
 AIRDROP_EXPIRE_CHECK_INTERVAL = 30
 
+# Теги участников (setChatMemberTag): раз в сколько секунд обновляем теги топа
+# и сколько первых мест их получают.
+MEMBER_TAG_REFRESH_INTERVAL = 10 * 60
+MEMBER_TAG_TOP_LIMIT = TOP_LIMIT
+
 
 # ── Настраиваемые параметры (админка → ⚙️ Настройки) ─────────────────────
 # key -> (раздел, подпись, единица, значение по умолчанию, минимум)
@@ -468,6 +473,16 @@ SCHEMA_STATEMENTS = (
     CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value BIGINT NOT NULL
+    )
+    """,
+    # Теги, которые бот выдал сам. Нужны, чтобы отличать свой тег от тега,
+    # который участнику поставили руками: чужой мы не трогаем и не затираем.
+    """
+    CREATE TABLE IF NOT EXISTS member_tags (
+        chat_id BIGINT NOT NULL,
+        user_id BIGINT NOT NULL,
+        tag TEXT NOT NULL,
+        PRIMARY KEY (chat_id, user_id)
     )
     """,
 )
@@ -2730,8 +2745,9 @@ async def cmd_angry_battle(message: Message, pool: asyncpg.Pool):
 
 
 @router.message(Command("angrytop", ignore_case=True), GROUP_CHATS)
-async def cmd_angry_top(message: Message, pool: asyncpg.Pool):
+async def cmd_angry_top(message: Message, bot: Bot, pool: asyncpg.Pool):
     await message.reply(await perform_top(pool, message.chat.id))
+    spawn_background_task(refresh_chat_tags(bot, pool, message.chat.id))
 
 
 @router.message(Command("angryinfo", ignore_case=True), GROUP_CHATS)
@@ -2825,8 +2841,9 @@ async def cb_group_battle(callback: CallbackQuery, pool: asyncpg.Pool):
 
 
 @router.callback_query(F.data == "group:top", GROUP_CALLBACKS)
-async def cb_group_top(callback: CallbackQuery, pool: asyncpg.Pool):
+async def cb_group_top(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
     await callback.message.reply(await perform_top(pool, callback.message.chat.id))
+    spawn_background_task(refresh_chat_tags(bot, pool, callback.message.chat.id))
     await callback.answer()
 
 
@@ -3278,6 +3295,128 @@ async def _expire_airdrops_once(bot: Bot, pool: asyncpg.Pool) -> None:
             pass
 
 
+# ── Теги участников ──────────────────────────────────────────────────────
+
+def format_compact(value: int) -> str:
+    """1 -> «1», 1300 -> «1.3к», 1000 -> «1к», 2_500_000 -> «2.5м».
+
+    Округляем вниз: тег не должен показывать больше, чем у игрока есть.
+    Десятая доля только одна и только если она ненулевая.
+    """
+    for limit, suffix in ((1_000_000_000, "млрд"), (1_000_000, "м"), (1_000, "к")):
+        if abs(value) >= limit:
+            tenths = int(abs(value) / limit * 10)
+            head, tail = divmod(tenths, 10)
+            sign = "-" if value < 0 else ""
+            return f"{sign}{head}.{tail}{suffix}" if tail else f"{sign}{head}{suffix}"
+    return str(value)
+
+
+def member_tag_text(power: int, money: int) -> str:
+    """Тег вида «сила/монеты». У тега лимит в 16 символов — режем с запасом."""
+    return f"{format_compact(power)}/{format_compact(money)}"[:16]
+
+
+async def get_tag_candidates(pool: asyncpg.Pool, chat_id: int) -> list[dict]:
+    rows = await pool.fetch(
+        """
+        SELECT cp.user_id, pl.power, cp.money
+        FROM chat_profiles cp
+        JOIN players pl ON pl.user_id = cp.user_id
+        WHERE cp.chat_id = $1
+        ORDER BY pl.power DESC
+        LIMIT $2
+        """,
+        chat_id, MEMBER_TAG_TOP_LIMIT,
+    )
+    return [dict(row) for row in rows]
+
+
+async def get_own_tags(pool: asyncpg.Pool, chat_id: int) -> dict[int, str]:
+    rows = await pool.fetch(
+        "SELECT user_id, tag FROM member_tags WHERE chat_id = $1", chat_id
+    )
+    return {row["user_id"]: row["tag"] for row in rows}
+
+
+async def remember_own_tag(pool: asyncpg.Pool, chat_id: int, user_id: int, tag: str) -> None:
+    await pool.execute(
+        "INSERT INTO member_tags (chat_id, user_id, tag) VALUES ($1, $2, $3) "
+        "ON CONFLICT (chat_id, user_id) DO UPDATE SET tag = EXCLUDED.tag",
+        chat_id, user_id, tag,
+    )
+
+
+async def forget_own_tag(pool: asyncpg.Pool, chat_id: int, user_id: int) -> None:
+    await pool.execute(
+        "DELETE FROM member_tags WHERE chat_id = $1 AND user_id = $2", chat_id, user_id
+    )
+
+
+async def refresh_chat_tags(bot: Bot, pool: asyncpg.Pool, chat_id: int) -> None:
+    """Проставляет топу чата тег «сила/монеты».
+
+    Чужие теги не трогаем: свой опознаём по записи в member_tags. Если текущий
+    тег участника не совпадает с тем, что мы ставили, значит его поменяли руками
+    — оставляем как есть и забываем про него. Кто выпал из топа, тег теряет.
+    """
+    own_tags = await get_own_tags(pool, chat_id)
+    candidates = await get_tag_candidates(pool, chat_id)
+    in_top = {row["user_id"] for row in candidates}
+
+    for row in candidates:
+        user_id = row["user_id"]
+        desired = member_tag_text(row["power"], row["money"])
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+        except TelegramAPIError:
+            continue
+
+        # Тег есть только у обычных участников: у админов и владельца вместо
+        # него custom_title, его через setChatMemberTag не поставить.
+        current = getattr(member, "tag", None)
+        if not hasattr(member, "tag"):
+            continue
+
+        if current and current != own_tags.get(user_id):
+            await forget_own_tag(pool, chat_id, user_id)
+            continue
+        if current == desired:
+            continue
+
+        try:
+            await bot.set_chat_member_tag(chat_id, user_id, desired)
+        except TelegramAPIError:
+            # Нет права can_manage_tags или чат не поддерживает теги — дальше
+            # в этом чате пробовать нечего.
+            return
+        await remember_own_tag(pool, chat_id, user_id, desired)
+
+    for user_id, tag in own_tags.items():
+        if user_id in in_top:
+            continue
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+        except TelegramAPIError:
+            continue
+        if getattr(member, "tag", None) == tag:
+            try:
+                await bot.set_chat_member_tag(chat_id, user_id, None)
+            except TelegramAPIError:
+                pass
+        await forget_own_tag(pool, chat_id, user_id)
+
+
+async def refresh_tags_loop(bot: Bot, pool: asyncpg.Pool) -> None:
+    while True:
+        await asyncio.sleep(MEMBER_TAG_REFRESH_INTERVAL)
+        for chat in await get_active_chats(pool):
+            try:
+                await refresh_chat_tags(bot, pool, chat["chat_id"])
+            except Exception:
+                logging.exception("Ошибка обновления тегов в чате %s", chat["chat_id"])
+
+
 _background_tasks: set[asyncio.Task] = set()
 
 
@@ -3352,6 +3491,7 @@ async def main() -> None:
         spawn_background_task(referral_promo_loop(bot, pool, me.username))
         spawn_background_task(airdrop_spawn_loop(bot, pool))
         spawn_background_task(expire_airdrops_loop(bot, pool))
+        spawn_background_task(refresh_tags_loop(bot, pool))
 
         await dp.start_polling(bot, pool=pool)
     finally:
