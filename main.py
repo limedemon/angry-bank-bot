@@ -1,11 +1,17 @@
 import asyncio
+import hashlib
+import hmac
 import html
+import json
 import logging
 import os
 import random
 import time
+from pathlib import Path
+from urllib.parse import parse_qsl
 
 import asyncpg
+from aiohttp import web
 from aiogram import Bot, BaseMiddleware, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -23,6 +29,7 @@ from aiogram.types import (
     InputMediaPhoto,
     Message,
     TelegramObject,
+    WebAppInfo,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -162,6 +169,7 @@ def group_intro_text() -> str:
         f"⚔️ /AngryBattle — сразиться с мобом ({setting('battle_energy_min')}-"
         f"{setting('battle_energy_max')}⚡, раз в {setting('battle_cooldown_min')} мин)\n"
         "ℹ️ /AngryInfo — профиль игрока (в ответ на сообщение)\n"
+        "🎒 /AngryInv — инвентарь: классы и предметы\n"
         "🏆 /AngryTop — топ силы чата\n\n"
         f"🏰 /clancreate Название — создать клан ({CLAN_CREATE_COST} монет)\n"
         "📨 /claninvite — пригласить в клан (в ответ на сообщение)\n"
@@ -485,6 +493,17 @@ SCHEMA_STATEMENTS = (
         PRIMARY KEY (chat_id, user_id)
     )
     """,
+    # Инвентарь игрока: сколько раз ему выпадала каждая карточка. Глобальный,
+    # как сила и токены — не делится по чатам. kind: 'card' (копилка) / 'class'.
+    """
+    CREATE TABLE IF NOT EXISTS inventory (
+        user_id BIGINT NOT NULL,
+        kind TEXT NOT NULL,
+        card_id INTEGER NOT NULL,
+        qty INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, kind, card_id)
+    )
+    """,
 )
 
 
@@ -642,21 +661,21 @@ async def apply_airdrop_loot(
             pool_choice = random.choice(("piggy", "class"))
             if pool_choice == "piggy":
                 card = await conn.fetchrow(
-                    "SELECT name, power, money, photo_id, rarity, bird FROM cards WHERE rarity = 5 ORDER BY random() LIMIT 1"
+                    "SELECT id, name, power, money, photo_id, rarity, bird FROM cards WHERE rarity = 5 ORDER BY random() LIMIT 1"
                 )
                 if card is None:
                     card = await conn.fetchrow(
-                        "SELECT name, power, photo_id, rarity, bird FROM class_cards WHERE rarity = 5 ORDER BY random() LIMIT 1"
+                        "SELECT id, name, power, photo_id, rarity, bird FROM class_cards WHERE rarity = 5 ORDER BY random() LIMIT 1"
                     )
                     if card is not None:
                         pool_choice = "class"
             else:
                 card = await conn.fetchrow(
-                    "SELECT name, power, photo_id, rarity, bird FROM class_cards WHERE rarity = 5 ORDER BY random() LIMIT 1"
+                    "SELECT id, name, power, photo_id, rarity, bird FROM class_cards WHERE rarity = 5 ORDER BY random() LIMIT 1"
                 )
                 if card is None:
                     card = await conn.fetchrow(
-                        "SELECT name, power, money, photo_id, rarity, bird FROM cards WHERE rarity = 5 ORDER BY random() LIMIT 1"
+                        "SELECT id, name, power, money, photo_id, rarity, bird FROM cards WHERE rarity = 5 ORDER BY random() LIMIT 1"
                     )
                     if card is not None:
                         pool_choice = "piggy"
@@ -677,6 +696,7 @@ async def apply_airdrop_loot(
                     chat_id, user_id, name, card["money"],
                 )
                 await maybe_update_best_card(conn, user_id, card)
+                await add_to_inventory(conn, user_id, "card", card)
                 lines.append(
                     f"🌌 <b>Астральная карточка (копилка): {card_title(card)}</b>\n"
                     f"{rarity_display(card['rarity'])}\n"
@@ -684,6 +704,7 @@ async def apply_airdrop_loot(
                 )
             else:
                 await maybe_update_best_class(conn, user_id, card)
+                await add_to_inventory(conn, user_id, "class", card)
                 lines.append(
                     f"🌌 <b>Астральная карточка (класс): {card_title(card)}</b>\n"
                     f"{rarity_display(card['rarity'])}\n"
@@ -852,6 +873,20 @@ async def add_player_power(conn: asyncpg.Connection, user_id: int, name: str, po
     )
 
 
+async def add_to_inventory(conn: asyncpg.Connection, user_id: int, kind: str, card: dict) -> None:
+    """Кладёт выпавшую карточку в инвентарь игрока (или увеличивает счётчик)."""
+    card_id = card.get("id")
+    if card_id is None:
+        return
+    await conn.execute(
+        """
+        INSERT INTO inventory (user_id, kind, card_id, qty) VALUES ($1, $2, $3, 1)
+        ON CONFLICT (user_id, kind, card_id) DO UPDATE SET qty = inventory.qty + 1
+        """,
+        user_id, kind, card_id,
+    )
+
+
 async def maybe_update_best_card(conn: asyncpg.Connection, user_id: int, card: dict) -> None:
     row = await conn.fetchrow(
         "SELECT best_card_rarity, best_card_power FROM players WHERE user_id = $1", user_id
@@ -961,12 +996,12 @@ def _weighted_card_pick(rows: list) -> dict | None:
 
 
 async def draw_random_card(conn: asyncpg.Connection) -> dict | None:
-    rows = await conn.fetch("SELECT name, power, money, photo_id, rarity, bird FROM cards")
+    rows = await conn.fetch("SELECT id, name, power, money, photo_id, rarity, bird FROM cards")
     return _weighted_card_pick(rows)
 
 
 async def draw_random_class_card(conn: asyncpg.Connection) -> dict | None:
-    rows = await conn.fetch("SELECT name, power, photo_id, rarity, bird FROM class_cards")
+    rows = await conn.fetch("SELECT id, name, power, photo_id, rarity, bird FROM class_cards")
     return _weighted_card_pick(rows)
 
 
@@ -1534,6 +1569,7 @@ async def perform_open(pool: asyncpg.Pool, chat_id: int, user) -> tuple[list[str
             await set_player_cooldown(conn, user.id, user.full_name, "last_open", now)
             for card in cards:
                 await maybe_update_best_card(conn, user.id, card)
+                await add_to_inventory(conn, user.id, "card", card)
 
             # Реферальные 1% владельцу группы — прибавляются прямо к его основным
             # деньгам (не отдельным счётчиком), молча, без уведомлений.
@@ -1611,6 +1647,7 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[list[st
             await set_player_cooldown(conn, user.id, user.full_name, "last_class", now)
             for card in cards:
                 await maybe_update_best_class(conn, user.id, card)
+                await add_to_inventory(conn, user.id, "class", card)
 
     caption = (
         f"{multiplier_banner(multiplier)}"
@@ -1834,14 +1871,10 @@ async def cmd_start_private(message: Message, command: CommandObject, state: FSM
         return
 
     admin_id = await get_admin_id(pool)
-    kb = None
-    if message.from_user.id == admin_id:
+    is_admin = message.from_user.id == admin_id
+    if is_admin:
         await state.clear()
-        builder = InlineKeyboardBuilder()
-        builder.button(text="⚙️ Админ-панель", callback_data="admin:menu")
-        builder.adjust(1)
-        kb = builder.as_markup()
-    await send_own_profile(message, pool, reply_markup=kb)
+    await send_own_profile(message, pool, is_admin=is_admin)
 
 
 @router.callback_query(F.data == "admin:menu", IsAdminPrivate())
@@ -2677,8 +2710,20 @@ def render_profile(
     return "\n".join(lines)
 
 
-async def send_own_profile(message: Message, pool: asyncpg.Pool, reply_markup=None) -> None:
+def profile_kb(is_admin: bool):
+    """Кнопки под профилем в ЛС: инвентарь (Mini App) и, для админа, панель.
+    Кнопку web_app Telegram разрешает только в личке — в группах её нет."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🎒 Инвентарь", web_app=WebAppInfo(url=WEBAPP_URL))
+    if is_admin:
+        builder.button(text="⚙️ Админ-панель", callback_data="admin:menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+async def send_own_profile(message: Message, pool: asyncpg.Pool, is_admin: bool = False) -> None:
     user = message.from_user
+    reply_markup = profile_kb(is_admin)
     summary = await get_player_summary(pool, user.id)
     if summary["chats"] == 0:
         await message.answer(
@@ -2706,7 +2751,8 @@ async def send_own_profile(message: Message, pool: asyncpg.Pool, reply_markup=No
 
 @router.message(F.chat.type == "private")
 async def show_profile(message: Message, pool: asyncpg.Pool):
-    await send_own_profile(message, pool)
+    admin_id = await get_admin_id(pool)
+    await send_own_profile(message, pool, is_admin=message.from_user.id == admin_id)
 
 
 # ── Групповые команды ─────────────────────────────────────────────────────
@@ -2721,6 +2767,19 @@ GROUP_CALLBACKS = F.message.chat.type.in_({"group", "supergroup"})
 @router.message(CommandStart(), GROUP_CHATS)
 async def cmd_start_group(message: Message):
     await message.reply(group_intro_text(), reply_markup=group_menu_kb())
+
+
+@router.message(Command("angryinv", ignore_case=True), GROUP_CHATS)
+async def cmd_angry_inv(message: Message, bot: Bot):
+    me = await bot.get_me()
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🎒 Открыть инвентарь", url=f"https://t.me/{me.username}?start=inv")
+    builder.adjust(1)
+    await message.reply(
+        "<b>🎒 Инвентарь открывается в личке с ботом.</b>\n"
+        "Там все твои классы и предметы — со звёздами и количеством.",
+        reply_markup=builder.as_markup(),
+    )
 
 
 @router.message(Command("angryopen", ignore_case=True), GROUP_CHATS)
@@ -3430,6 +3489,284 @@ def spawn_background_task(coro) -> asyncio.Task:
     return task
 
 
+# ── Инвентарь: Mini App ──────────────────────────────────────────────────
+
+# Публичный адрес, по которому bothost отдаёт наш порт наружу. Telegram
+# открывает Mini App только по https, поэтому здесь именно https-домен.
+WEBAPP_URL = "https://bot-1788356307-5467-limedemon-2.bothost.tech"
+WEBAPP_PORT = 3000
+
+WEBAPP_DIR = Path(__file__).with_name("webapp")
+WEBAPP_CACHE_DIR = WEBAPP_DIR / "cache"
+
+# Файл текстуры звезды под каждый тип редкости (см. RARITY_INFO).
+STAR_FILES = {
+    "regular": "star-common.png",
+    "rainbow": "star-rainbow.png",
+    "astral": "star-astral.png",
+}
+
+
+INVENTORY_PAGE = """<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Инвентарь</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    background: radial-gradient(circle at 30% 20%, #3a6ea5, #1b2f4b 60%, #101c2e);
+    padding: 12px;
+  }
+  .window {
+    max-width: 720px; margin: 0 auto;
+    background: linear-gradient(#f6e3c5, #e8cfa8);
+    border: 5px solid #7a4a21; border-radius: 20px; overflow: hidden;
+    box-shadow: 0 14px 40px rgba(0,0,0,.45), inset 0 2px 0 rgba(255,255,255,.6);
+  }
+  header {
+    background: linear-gradient(#9a5b26, #7a4319);
+    padding: 12px 18px; display: flex; align-items: center;
+    justify-content: space-between; gap: 10px;
+    border-bottom: 4px solid #5e3312;
+  }
+  h1 {
+    margin: 0; font-size: 21px; letter-spacing: 2px; color: #ffe9c4;
+    text-transform: uppercase; text-shadow: 0 3px 0 #4b2a0e;
+  }
+  .total {
+    background: #ffcf6b; color: #6b3d12; font-weight: 700; font-size: 12px;
+    padding: 6px 12px; border-radius: 999px; border: 2px solid #b9832f;
+    white-space: nowrap;
+  }
+  .tabs { display: flex; gap: 8px; padding: 12px 16px 0; }
+  .tab {
+    flex: 1; padding: 10px; text-align: center; cursor: pointer;
+    user-select: none; font-weight: 700; font-size: 14px; color: #7a4a21;
+    background: #dcbb8d; border: 3px solid #b98a52; border-bottom: none;
+    border-radius: 12px 12px 0 0;
+  }
+  .tab.on { background: #fff6e6; color: #4b2a0e; box-shadow: inset 0 3px 0 #ffcf6b; }
+  .panel {
+    margin: 0 16px 16px; padding: 14px; background: #fff6e6;
+    border: 3px solid #b98a52; border-top: none; border-radius: 0 0 14px 14px;
+    min-height: 180px;
+  }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 12px; }
+  .cell {
+    position: relative; background: linear-gradient(#ffffff, #ffeed3);
+    border: 3px solid #c79a5f; border-radius: 14px; padding: 7px;
+    display: flex; flex-direction: column; align-items: center; gap: 5px;
+    box-shadow: 0 3px 0 #c79a5f;
+  }
+  .pic { width: 100%; aspect-ratio: 1; border-radius: 10px; overflow: hidden; background: #f0e0c6; }
+  .pic img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .stars { display: flex; gap: 2px; height: 20px; }
+  .stars img { width: 20px; height: 20px; object-fit: contain; }
+  .nm { font-size: 11px; font-weight: 700; color: #5e3312; text-align: center; line-height: 1.2; }
+  .qty {
+    position: absolute; top: -7px; right: -7px; z-index: 2;
+    background: #e8562a; color: #fff; font-weight: 800; font-size: 12px;
+    padding: 3px 8px; border-radius: 999px; border: 2px solid #fff6e6;
+    box-shadow: 0 2px 4px rgba(0,0,0,.3);
+  }
+  .empty { text-align: center; color: #9a7345; font-weight: 700; padding: 40px 10px; line-height: 1.5; white-space: pre-line; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+  <div class="window">
+    <header>
+      <h1>Инвентарь</h1>
+      <div class="total" id="total">…</div>
+    </header>
+    <div class="tabs">
+      <div class="tab on" data-t="classes">🐦 Классы</div>
+      <div class="tab" data-t="items">⚔️ Предметы</div>
+    </div>
+    <div class="panel">
+      <div id="body" class="empty">Загружаю…</div>
+    </div>
+  </div>
+<script>
+  const tg = window.Telegram ? window.Telegram.WebApp : null;
+  if (tg) { tg.ready(); tg.expand(); }
+
+  let data = { classes: [], items: [] };
+  let tab = "classes";
+  const LABELS = { classes: "Птиц", items: "Предметов" };
+  const EMPTY = {
+    classes: "Пока пусто.\\nКрути /AngryClass в группе!",
+    items: "Пока пусто.\\nКрути /AngryOpen в группе!"
+  };
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+
+  function render() {
+    document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x.dataset.t === tab));
+    const list = data[tab] || [];
+    const total = list.reduce((a, i) => a + i.qty, 0);
+    document.getElementById("total").textContent = LABELS[tab] + ": " + total;
+    const box = document.getElementById("body");
+    if (!list.length) {
+      box.className = "empty";
+      box.textContent = EMPTY[tab];
+      return;
+    }
+    box.className = "grid";
+    box.innerHTML = list.map(i => `
+      <div class="cell">
+        <div class="qty">×${i.qty}</div>
+        <div class="pic"><img src="${esc(i.img)}" alt="" loading="lazy"></div>
+        <div class="stars">${'<img src="/static/' + esc(i.star) + '" alt="">'.repeat(i.stars)}</div>
+        <div class="nm">${esc(i.name)}</div>
+      </div>`).join("");
+  }
+
+  document.querySelectorAll(".tab").forEach(x => x.onclick = () => { tab = x.dataset.t; render(); });
+
+  fetch("/api/inventory", { headers: { "X-Init-Data": tg ? tg.initData : "" } })
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(j => { data = j; render(); })
+    .catch(e => {
+      const box = document.getElementById("body");
+      box.className = "empty";
+      box.textContent = e === 403
+        ? "Открой инвентарь через кнопку в боте."
+        : "Не удалось загрузить инвентарь.";
+      document.getElementById("total").textContent = "—";
+    });
+</script>
+</body>
+</html>
+"""
+
+
+def verify_webapp_init_data(token: str, init_data: str) -> dict | None:
+    """Проверяет подпись initData от Telegram. Без этого любой мог бы
+    попросить чужой инвентарь, просто подставив user_id в запрос."""
+    try:
+        parsed = dict(parse_qsl(init_data, keep_blank_values=True))
+    except ValueError:
+        return None
+    received_hash = parsed.pop("hash", None)
+    if not received_hash:
+        return None
+    check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+    secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    calculated = hmac.new(secret, check_string.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calculated, received_hash):
+        return None
+    try:
+        if time.time() - float(parsed.get("auth_date", 0)) > 86400:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return parsed
+
+
+async def get_inventory(pool: asyncpg.Pool, user_id: int) -> list[dict]:
+    rows = await pool.fetch(
+        """
+        SELECT i.kind, i.qty, c.name, c.photo_id, c.rarity
+        FROM inventory i JOIN cards c ON c.id = i.card_id
+        WHERE i.user_id = $1 AND i.kind = 'card'
+        UNION ALL
+        SELECT i.kind, i.qty, cc.name, cc.photo_id, cc.rarity
+        FROM inventory i JOIN class_cards cc ON cc.id = i.card_id
+        WHERE i.user_id = $1 AND i.kind = 'class'
+        ORDER BY rarity DESC, qty DESC, name
+        """,
+        user_id,
+    )
+    items = []
+    for row in rows:
+        count, star_kind = RARITY_INFO.get(row["rarity"], (1, "regular"))
+        items.append({
+            "kind": row["kind"],
+            "name": row["name"],
+            "qty": row["qty"],
+            "stars": count,
+            "star": STAR_FILES.get(star_kind, "star-common.png"),
+            "img": f"/img/{row['photo_id']}",
+        })
+    return items
+
+
+async def webapp_index(request: web.Request) -> web.Response:
+    return web.Response(text=INVENTORY_PAGE, content_type="text/html")
+
+
+async def webapp_api_inventory(request: web.Request) -> web.Response:
+    init_data = request.headers.get("X-Init-Data") or ""
+    parsed = verify_webapp_init_data(request.app["token"], init_data)
+    if parsed is None:
+        return web.json_response({"error": "bad_signature"}, status=403)
+    try:
+        user = json.loads(parsed.get("user", "{}"))
+        user_id = int(user["id"])
+    except (ValueError, KeyError, TypeError):
+        return web.json_response({"error": "no_user"}, status=400)
+
+    pool = request.app["pool"]
+    items = await get_inventory(pool, user_id)
+    return web.json_response({
+        "name": user.get("first_name") or "Игрок",
+        "classes": [i for i in items if i["kind"] == "class"],
+        "items": [i for i in items if i["kind"] == "card"],
+    })
+
+
+async def webapp_image(request: web.Request) -> web.StreamResponse:
+    """Отдаёт фото карточки браузеру: у него нет доступа к file_id, поэтому
+    один раз качаем файл из Telegram и дальше раздаём с диска."""
+    file_id = request.match_info["file_id"]
+    path = WEBAPP_CACHE_DIR / (hashlib.sha256(file_id.encode()).hexdigest() + ".jpg")
+    if not path.exists():
+        pool = request.app["pool"]
+        known = await pool.fetchval(
+            """
+            SELECT 1 FROM cards WHERE photo_id = $1
+            UNION ALL SELECT 1 FROM class_cards WHERE photo_id = $1 LIMIT 1
+            """,
+            file_id,
+        )
+        if not known:
+            raise web.HTTPNotFound()
+        bot: Bot = request.app["bot"]
+        try:
+            tg_file = await bot.get_file(file_id)
+            buffer = await bot.download_file(tg_file.file_path)
+        except TelegramAPIError:
+            raise web.HTTPNotFound()
+        WEBAPP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(buffer.read())
+    return web.FileResponse(path, headers={"Cache-Control": "public, max-age=604800"})
+
+
+async def start_webapp(bot: Bot, pool: asyncpg.Pool, token: str) -> web.AppRunner:
+    app = web.Application()
+    app["bot"] = bot
+    app["pool"] = pool
+    app["token"] = token
+    app.router.add_get("/", webapp_index)
+    app.router.add_get("/api/inventory", webapp_api_inventory)
+    app.router.add_get("/img/{file_id}", webapp_image)
+    app.router.add_static("/static", WEBAPP_DIR)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", WEBAPP_PORT)
+    await site.start()
+    logging.info("Mini App слушает порт %s", WEBAPP_PORT)
+    return runner
+
+
 # ── Запуск ───────────────────────────────────────────────────────────────
 
 async def set_bot_commands(bot: Bot) -> None:
@@ -3450,6 +3787,7 @@ async def set_bot_commands(bot: Bot) -> None:
             BotCommand(command="clan", description="инфо о клане"),
             BotCommand(command="angryinfo", description="профиль игрока (в ответ на сообщение)"),
             BotCommand(command="angrybattle", description="сразиться с мобом"),
+            BotCommand(command="angryinv", description="инвентарь: классы и предметы"),
             BotCommand(command="angrytop", description="открыть лидерборд"),
         ],
         scope=BotCommandScopeAllGroupChats(),
@@ -3493,7 +3831,11 @@ async def main() -> None:
         spawn_background_task(expire_airdrops_loop(bot, pool))
         spawn_background_task(refresh_tags_loop(bot, pool))
 
-        await dp.start_polling(bot, pool=pool)
+        runner = await start_webapp(bot, pool, token)
+        try:
+            await dp.start_polling(bot, pool=pool)
+        finally:
+            await runner.cleanup()
     finally:
         await pool.close()
 
