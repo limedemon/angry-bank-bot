@@ -151,6 +151,97 @@ AIRDROP_LOOT = {
     ],
 }
 
+# Тир -> «1 в N»: во сколько раз реже он выпадает. Это лишь значения по
+# умолчанию — рабочие лежат в airdrop_tier_weights и правятся из админки.
+AIRDROP_TIER_ONE_IN = {code: round(1 / weight) for code, _l, weight, _i in AIRDROP_TIERS}
+
+# Строки дропа: код -> (подпись, есть ли диапазон значений)
+AIRDROP_KINDS = (
+    ("power", "⚔️ Сила", True),
+    ("money", "🪙 Монеты", True),
+    ("tokens", "🐟 Токены", True),
+    ("astral", "🌌 Астральная карточка", False),
+)
+AIRDROP_KIND_LABELS = {kind: label for kind, label, _ in AIRDROP_KINDS}
+AIRDROP_KIND_HAS_RANGE = {kind: has_range for kind, _l, has_range in AIRDROP_KINDS}
+
+_airdrop_loot_cache: dict[str, dict[str, tuple[int, int, float]]] = {}
+_airdrop_weight_cache: dict[str, int] = {}
+
+
+def default_loot_line(tier: str, kind: str) -> tuple[int, int, float]:
+    for line_kind, lo, hi, chance in AIRDROP_LOOT.get(tier, ()):
+        if line_kind == kind:
+            return lo, hi, chance
+    return 0, 0, 0.0
+
+
+async def load_airdrop_config(pool: asyncpg.Pool) -> None:
+    """Заливает дефолты при первом запуске и поднимает конфиг в кэш.
+    В таблице есть строка на каждую пару тир+тип, у выключенных шанс 0 —
+    так админ может включить в тире то, чего в нём изначально не было."""
+    for tier, _label, _weight, _icon in AIRDROP_TIERS:
+        await pool.execute(
+            "INSERT INTO airdrop_tier_weights (tier, one_in) VALUES ($1, $2) ON CONFLICT (tier) DO NOTHING",
+            tier, AIRDROP_TIER_ONE_IN[tier],
+        )
+        for kind, _kl, _kr in AIRDROP_KINDS:
+            lo, hi, chance = default_loot_line(tier, kind)
+            await pool.execute(
+                "INSERT INTO airdrop_loot (tier, kind, lo, hi, chance) VALUES ($1, $2, $3, $4, $5) "
+                "ON CONFLICT (tier, kind) DO NOTHING",
+                tier, kind, lo, hi, chance,
+            )
+    await refresh_airdrop_config(pool)
+
+
+async def refresh_airdrop_config(pool: asyncpg.Pool) -> None:
+    _airdrop_weight_cache.clear()
+    for row in await pool.fetch("SELECT tier, one_in FROM airdrop_tier_weights"):
+        _airdrop_weight_cache[row["tier"]] = row["one_in"]
+    _airdrop_loot_cache.clear()
+    for row in await pool.fetch("SELECT tier, kind, lo, hi, chance FROM airdrop_loot"):
+        _airdrop_loot_cache.setdefault(row["tier"], {})[row["kind"]] = (
+            row["lo"], row["hi"], row["chance"],
+        )
+
+
+def airdrop_one_in(tier: str) -> int:
+    return max(1, _airdrop_weight_cache.get(tier) or AIRDROP_TIER_ONE_IN.get(tier, 1))
+
+
+def airdrop_line(tier: str, kind: str) -> tuple[int, int, float]:
+    cached = _airdrop_loot_cache.get(tier, {}).get(kind)
+    return cached if cached is not None else default_loot_line(tier, kind)
+
+
+async def save_airdrop_line(
+    pool: asyncpg.Pool, tier: str, kind: str, lo: int, hi: int, chance: float
+) -> None:
+    await pool.execute(
+        "INSERT INTO airdrop_loot (tier, kind, lo, hi, chance) VALUES ($1, $2, $3, $4, $5) "
+        "ON CONFLICT (tier, kind) DO UPDATE SET lo = EXCLUDED.lo, hi = EXCLUDED.hi, "
+        "chance = EXCLUDED.chance",
+        tier, kind, lo, hi, chance,
+    )
+    _airdrop_loot_cache.setdefault(tier, {})[kind] = (lo, hi, chance)
+
+
+async def save_airdrop_weight(pool: asyncpg.Pool, tier: str, one_in: int) -> None:
+    await pool.execute(
+        "INSERT INTO airdrop_tier_weights (tier, one_in) VALUES ($1, $2) "
+        "ON CONFLICT (tier) DO UPDATE SET one_in = EXCLUDED.one_in",
+        tier, one_in,
+    )
+    _airdrop_weight_cache[tier] = one_in
+
+
+def fmt_chance(chance: float) -> str:
+    if chance <= 0:
+        return "выкл"
+    return f"{chance * 100:g}%"
+
+
 def group_intro_text() -> str:
     """Строится на лету — цифры берутся из настроек, которые админ может менять."""
     return (
@@ -496,6 +587,22 @@ SCHEMA_STATEMENTS = (
     # Инвентарь игрока: сколько раз ему выпадала каждая карточка. Глобальный,
     # как сила и токены — не делится по чатам. kind: 'card' (копилка) / 'class'.
     """
+    CREATE TABLE IF NOT EXISTS airdrop_tier_weights (
+        tier TEXT PRIMARY KEY,
+        one_in INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS airdrop_loot (
+        tier TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        lo BIGINT NOT NULL,
+        hi BIGINT NOT NULL,
+        chance DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY (tier, kind)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS inventory (
         user_id BIGINT NOT NULL,
         kind TEXT NOT NULL,
@@ -595,13 +702,19 @@ async def notify_admin_broadcast_results(
 
 def roll_airdrop_tier() -> tuple[str, str, str]:
     codes = [t[0] for t in AIRDROP_TIERS]
-    weights = [t[2] for t in AIRDROP_TIERS]
+    weights = [1 / airdrop_one_in(code) for code in codes]
     code = random.choices(codes, weights=weights, k=1)[0]
     return code, AIRDROP_TIER_LABELS[code], AIRDROP_TIER_ICONS[code]
 
 
 def roll_airdrop_loot(tier: str) -> list[tuple]:
-    lines = AIRDROP_LOOT[tier]
+    lines = []
+    for kind, _label, _has_range in AIRDROP_KINDS:
+        lo, hi, chance = airdrop_line(tier, kind)
+        if chance > 0:
+            lines.append((kind, lo, hi, chance))
+    if not lines:
+        return []
     hits = [line for line in lines if random.random() < line[3]]
     if not hits:
         hits = [max(lines, key=lambda line: line[3])]
@@ -1302,6 +1415,10 @@ class EditSetting(StatesGroup):
     waiting_value = State()
 
 
+class EditDrop(StatesGroup):
+    waiting_value = State()
+
+
 # ── Клавиатуры ───────────────────────────────────────────────────────────
 
 def admin_menu_text() -> str:
@@ -1316,7 +1433,65 @@ def admin_menu_kb():
     kb.button(text="🌐 Все группы", callback_data="chats:menu")
     kb.button(text="📣 Разослать рекламу", callback_data="admin:promo")
     kb.button(text="🎁 Запустить аирдроп", callback_data="admin:airdrop")
+    kb.button(text="🎁 Дроп аирдропов", callback_data="drop:menu")
     kb.button(text="⚙️ Настройки", callback_data="settings:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def drop_menu_kb():
+    kb = InlineKeyboardBuilder()
+    for code, label, _weight, icon in AIRDROP_TIERS:
+        kb.button(text=f"{icon} {label} — 1 к {airdrop_one_in(code)}", callback_data=f"drop:tier:{code}")
+    kb.button(text="⬅️ Назад", callback_data="admin:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def drop_line_summary(tier: str, kind: str) -> str:
+    lo, hi, chance = airdrop_line(tier, kind)
+    if chance <= 0:
+        return "выкл"
+    if AIRDROP_KIND_HAS_RANGE[kind]:
+        return f"{lo}–{hi} · {fmt_chance(chance)}"
+    return fmt_chance(chance)
+
+
+def drop_tier_text(tier: str) -> str:
+    lines = [
+        f"<b>{AIRDROP_TIER_ICONS[tier]} {AIRDROP_TIER_LABELS[tier]} — содержимое дропа</b>",
+        "",
+        f"<b>Как часто выпадает тир:</b> 1 к {airdrop_one_in(tier)}",
+        "",
+    ]
+    for kind, label, _has_range in AIRDROP_KINDS:
+        lines.append(f"<b>{label}:</b> {drop_line_summary(tier, kind)}")
+    lines += [
+        "",
+        "Каждая строка проверяется своим шансом отдельно. Если не выпала ни одна, "
+        "игрок всё равно получает самую вероятную из них — пустых дропов не бывает.",
+        "",
+        "Нажми на строку, чтобы изменить.",
+    ]
+    return "\n".join(lines)
+
+
+def drop_tier_kb(tier: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"🎲 Частота тира: 1 к {airdrop_one_in(tier)}", callback_data=f"drop:weight:{tier}")
+    for kind, label, _has_range in AIRDROP_KINDS:
+        kb.button(text=f"{label}: {drop_line_summary(tier, kind)}", callback_data=f"drop:line:{tier}:{kind}")
+    kb.button(text="⬅️ Назад", callback_data="drop:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def drop_line_kb(tier: str, kind: str):
+    kb = InlineKeyboardBuilder()
+    if AIRDROP_KIND_HAS_RANGE[kind]:
+        kb.button(text="🔢 Диапазон", callback_data=f"drop:edit:{tier}:{kind}:range")
+    kb.button(text="🎯 Шанс", callback_data=f"drop:edit:{tier}:{kind}:chance")
+    kb.button(text="⬅️ Назад", callback_data=f"drop:tier:{tier}")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -1919,6 +2094,140 @@ async def admin_airdrop_cb(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool
         f"{AIRDROP_CHAT_STAGGER_MIN}-{AIRDROP_CHAT_STAGGER_MAX} сек."
     )
     spawn_background_task(spawn_airdrop_cycle(bot, pool))
+
+
+@router.callback_query(F.data == "drop:menu", IsAdminPrivate())
+async def drop_menu_cb(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_edit_text(
+        callback.message,
+        "<b>🎁 Дроп аирдропов</b>\n\n"
+        "Выбери тир — внутри настраивается, как часто он выпадает и что в нём лежит.",
+        reply_markup=drop_menu_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("drop:tier:"), IsAdminPrivate())
+async def drop_tier_cb(callback: CallbackQuery, state: FSMContext):
+    tier = callback.data.split(":")[2]
+    if tier not in AIRDROP_TIER_LABELS:
+        await callback.answer("Неизвестный тир", show_alert=True)
+        return
+    await state.clear()
+    await safe_edit_text(callback.message, drop_tier_text(tier), reply_markup=drop_tier_kb(tier))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("drop:line:"), IsAdminPrivate())
+async def drop_line_cb(callback: CallbackQuery, state: FSMContext):
+    _, _, tier, kind = callback.data.split(":")
+    if tier not in AIRDROP_TIER_LABELS or kind not in AIRDROP_KIND_LABELS:
+        await callback.answer("Неизвестная строка", show_alert=True)
+        return
+    await state.clear()
+    lo, hi, chance = airdrop_line(tier, kind)
+    text = [
+        f"<b>{AIRDROP_KIND_LABELS[kind]}</b> в тире {AIRDROP_TIER_LABELS[tier].lower()}",
+        "",
+        f"<b>Шанс попасть в дроп:</b> {fmt_chance(chance)}",
+    ]
+    if AIRDROP_KIND_HAS_RANGE[kind]:
+        text.append(f"<b>Сколько выдаётся:</b> {lo}–{hi}")
+    text += ["", "Что меняем?"]
+    await safe_edit_text(callback.message, "\n".join(text), reply_markup=drop_line_kb(tier, kind))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("drop:weight:"), IsAdminPrivate())
+async def drop_weight_cb(callback: CallbackQuery, state: FSMContext):
+    tier = callback.data.split(":")[2]
+    if tier not in AIRDROP_TIER_LABELS:
+        await callback.answer("Неизвестный тир", show_alert=True)
+        return
+    await state.set_state(EditDrop.waiting_value)
+    await state.update_data(drop_tier=tier, drop_kind=None, drop_mode="weight")
+    await safe_edit_text(
+        callback.message,
+        f"<b>🎲 Частота тира «{AIRDROP_TIER_LABELS[tier]}»</b>\n\n"
+        f"Сейчас: 1 к {airdrop_one_in(tier)}\n"
+        f"По умолчанию: 1 к {AIRDROP_TIER_ONE_IN[tier]}\n\n"
+        "Введи число N — вес тира станет 1/N: чем больше N, тем реже он выпадает.\n"
+        "Точная доля зависит и от остальных тиров, ведь они делят 100% между собой.",
+        reply_markup=cancel_kb(f"drop:tier:{tier}"),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("drop:edit:"), IsAdminPrivate())
+async def drop_edit_cb(callback: CallbackQuery, state: FSMContext):
+    _, _, tier, kind, mode = callback.data.split(":")
+    if tier not in AIRDROP_TIER_LABELS or kind not in AIRDROP_KIND_LABELS:
+        await callback.answer("Неизвестная строка", show_alert=True)
+        return
+    await state.set_state(EditDrop.waiting_value)
+    await state.update_data(drop_tier=tier, drop_kind=kind, drop_mode=mode)
+    lo, hi, chance = airdrop_line(tier, kind)
+    if mode == "chance":
+        body = (
+            f"Сейчас: {fmt_chance(chance)}\n\n"
+            "Введи шанс в процентах (например 40, 0.1 или 100).\n"
+            "0 — выключить строку совсем."
+        )
+    else:
+        body = f"Сейчас: {lo}–{hi}\n\nВведи диапазон в виде «10-20»:"
+    await safe_edit_text(
+        callback.message,
+        f"<b>{AIRDROP_KIND_LABELS[kind]} — {AIRDROP_TIER_LABELS[tier].lower()} тир</b>\n\n{body}",
+        reply_markup=cancel_kb(f"drop:line:{tier}:{kind}"),
+    )
+    await callback.answer()
+
+
+@router.message(EditDrop.waiting_value, IsAdminPrivate())
+async def drop_edit_value(message: Message, state: FSMContext, pool: asyncpg.Pool):
+    data = await state.get_data()
+    tier, kind, mode = data["drop_tier"], data.get("drop_kind"), data["drop_mode"]
+    raw = (message.text or "").strip()
+
+    if mode == "weight":
+        try:
+            one_in = int(raw)
+        except ValueError:
+            await message.answer("<b>Нужно целое число. Попробуй ещё раз.</b>")
+            return
+        if one_in < 1:
+            await message.answer("<b>Минимум 1. Попробуй ещё раз.</b>")
+            return
+        await save_airdrop_weight(pool, tier, one_in)
+        done = f"✅ {AIRDROP_TIER_LABELS[tier]}: 1 к {one_in}"
+    elif mode == "chance":
+        try:
+            percent = float(raw.replace(",", ".").rstrip("%").strip())
+        except ValueError:
+            await message.answer("<b>Нужно число в процентах, например 40 или 0.1. Попробуй ещё раз.</b>")
+            return
+        if not 0 <= percent <= 100:
+            await message.answer("<b>Шанс должен быть от 0 до 100. Попробуй ещё раз.</b>")
+            return
+        lo, hi, _chance = airdrop_line(tier, kind)
+        await save_airdrop_line(pool, tier, kind, lo, hi, percent / 100)
+        done = f"✅ {AIRDROP_KIND_LABELS[kind]}: {fmt_chance(percent / 100)}"
+    else:
+        parts = "".join(ch if ch.isdigit() else " " for ch in raw).split()
+        if len(parts) != 2:
+            await message.answer("<b>Введи диапазон в виде «10-20». Попробуй ещё раз.</b>")
+            return
+        lo, hi = int(parts[0]), int(parts[1])
+        if lo > hi:
+            lo, hi = hi, lo
+        _lo, _hi, chance = airdrop_line(tier, kind)
+        await save_airdrop_line(pool, tier, kind, lo, hi, chance)
+        done = f"✅ {AIRDROP_KIND_LABELS[kind]}: {lo}–{hi}"
+
+    await state.clear()
+    await message.answer(f"<b>{done}</b>")
+    await message.answer(drop_tier_text(tier), reply_markup=drop_tier_kb(tier))
 
 
 @router.callback_query(F.data == "settings:menu", IsAdminPrivate())
@@ -2941,7 +3250,8 @@ async def airdrop_claim_cb(callback: CallbackQuery, pool: asyncpg.Pool):
     label = AIRDROP_TIER_LABELS[row["tier"]]
     icon = AIRDROP_TIER_ICONS[row["tier"]]
     mention = f"<a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a>"
-    text = f"<b>{icon} {mention} забрал {label.lower()} дроп!</b>\n\n" + "\n".join(loot_lines)
+    body = "\n".join(loot_lines) if loot_lines else "— в этот раз пусто"
+    text = f"<b>{icon} {mention} забрал {label.lower()} дроп!</b>\n\n" + body
     await safe_edit_text(callback.message, text)
     await callback.answer("Забрано!")
 
@@ -3813,6 +4123,7 @@ async def main() -> None:
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5)
     await init_db(pool)
     await load_settings(pool)
+    await load_airdrop_config(pool)
     try:
         bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         dp = Dispatcher(storage=MemoryStorage())
