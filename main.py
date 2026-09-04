@@ -1871,8 +1871,8 @@ SLOT_LABELS = {"bar": "BAR", "grape": "🍇", "lemon": "🍋", "seven": "7️⃣
 
 # Все множители — в сотых, чтобы считать выплату на целых числах.
 # Лесенка: чем «старше» символ, тем слабее он поодиночке и тем жирнее тройка.
-SLOT_SINGLE = {"grape": 13, "lemon": 10, "bar": 7, "seven": 3}
-SLOT_PAIR = {"grape": 67, "lemon": 57, "bar": 53, "seven": 20}
+SLOT_SINGLE = {"grape": 15, "lemon": 20, "bar": 15, "seven": 10}
+SLOT_PAIR = {"grape": 100, "lemon": 100, "bar": 53, "seven": 20}
 SLOT_TRIPLE = {"grape": 167, "lemon": 233, "bar": 333, "seven": 667}
 
 # Барабаны крутятся у игрока около двух секунд. Значение бот знает сразу,
