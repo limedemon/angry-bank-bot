@@ -1464,7 +1464,6 @@ def admin_menu_kb():
     kb.button(text="🌐 Все группы", callback_data="chats:menu")
     kb.button(text="📣 Разослать рекламу", callback_data="admin:promo")
     kb.button(text="🎁 Запустить аирдроп", callback_data="admin:airdrop")
-    kb.button(text="🎁 Дроп аирдропов", callback_data="drop:menu")
     kb.button(text="⚙️ Настройки", callback_data="settings:menu")
     kb.adjust(1)
     return kb.as_markup()
@@ -1484,7 +1483,7 @@ def drop_menu_kb():
     kb = InlineKeyboardBuilder()
     for code, label, _weight, icon in AIRDROP_TIERS:
         kb.button(text=f"{icon} {label} — 1 к {airdrop_one_in(code)}", callback_data=f"drop:tier:{code}")
-    kb.button(text="⬅️ Назад", callback_data="admin:menu")
+    kb.button(text="⬅️ Назад", callback_data="settings:menu")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -1541,6 +1540,7 @@ def settings_menu_kb():
     kb = InlineKeyboardBuilder()
     for section, label in SETTINGS_SECTIONS.items():
         kb.button(text=label, callback_data=f"settings:section:{section}")
+    kb.button(text="🎁 Дроп аирдропов", callback_data="drop:menu")
     kb.button(text="⬅️ Назад", callback_data="admin:menu")
     kb.adjust(1)
     return kb.as_markup()
