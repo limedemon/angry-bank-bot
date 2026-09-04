@@ -2378,6 +2378,9 @@ async def owned_card_ids(pool: asyncpg.Pool, user_id: int, kind: str) -> set[int
 
 async def index_text(pool: asyncpg.Pool, kind: str, page: int, user_id: int) -> tuple[str, int, int]:
     cards = await (list_cards(pool) if kind == "item" else list_class_cards(pool))
+    # От слабых к сильным: сначала редкость, внутри неё — сила (id только чтобы
+    # порядок не прыгал между страницами у одинаковых карточек).
+    cards.sort(key=lambda card: (card["rarity"], card["power"], card["id"]))
     pages = max(1, (len(cards) + INDEX_PAGE_SIZE - 1) // INDEX_PAGE_SIZE)
     page = max(0, min(page, pages - 1))
     if not cards:
