@@ -312,6 +312,7 @@ ASTRAL_STAR_EMOJI_ID = "5233626046284212790"
 
 # Премиум-эмодзи монеты — та же, что и в остальных сообщениях бота.
 COIN_EMOJI = "<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji>"
+TOKEN_EMOJI = "<tg-emoji emoji-id='5233482504182212210'>🐟</tg-emoji>"
 
 # rarity code -> (кол-во звёзд, тип звезды)
 RARITY_INFO = {
@@ -2128,29 +2129,51 @@ async def perform_battle(pool: asyncpg.Pool, chat_id: int, user) -> tuple[str | 
     return mob["photo_id"], caption
 
 
-async def perform_top(pool: asyncpg.Pool, chat_id: int) -> str:
+# Лидерборды по валютам: код -> (подпись кнопки, заголовок, откуда берём число,
+# чем помечаем значение, что писать, когда всё по нулям).
+# Сила и токены у игрока общие на все чаты, монеты — свои в каждом; ранжируем
+# в любом случае только участников этого чата.
+TOP_METRICS = {
+    "power": ("⚔️ Сила", "🏆 Топ силы чата", "pl.power", "⚔️",
+              "📭 Пока никто не крутил копилку в этом чате."),
+    "money": ("🪙 Монеты", "💰 Топ богачей чата", "cp.money", COIN_EMOJI,
+              "📭 Пока ни у кого нет монет в этом чате."),
+    "tokens": ("🐟 Токены", "🐟 Топ по токенам", "pl.tokens", TOKEN_EMOJI,
+               "📭 Пока ни у кого нет токенов."),
+}
+
+
+def top_kb(metric: str, owner_id: int):
+    kb = InlineKeyboardBuilder()
+    for code, (label, *_rest) in TOP_METRICS.items():
+        mark = "• " if code == metric else ""
+        kb.button(text=f"{mark}{label}", callback_data=f"top:{code}:{owner_id}")
+    kb.adjust(3)
+    return kb.as_markup()
+
+
+async def perform_top(pool: asyncpg.Pool, chat_id: int, metric: str = "power") -> str:
+    _label, title, column, mark, empty = TOP_METRICS[metric]
     rows = await pool.fetch(
-        """
-        SELECT cp.name, pl.power
+        f"""
+        SELECT cp.name, {column} AS value
         FROM chat_profiles cp
         JOIN players pl ON pl.user_id = cp.user_id
         WHERE cp.chat_id = $1
-        ORDER BY pl.power DESC
+        ORDER BY {column} DESC
         LIMIT $2
         """,
         chat_id, TOP_LIMIT,
     )
-    if not rows:
-        return "<b>📭 Пока никто не крутил копилку в этом чате.</b>"
+    if not rows or rows[0]["value"] <= 0:
+        return f"<b>{empty}</b>"
 
     medals = ["🥇", "🥈", "🥉"]
-    lines = ["<b>🏆 Топ силы чата", "━━━━━━━━━━━━━━", ""]
+    lines = [f"<b>{title}", "━━━━━━━━━━━━━━", ""]
     for i, row in enumerate(rows):
         name = html.escape(row["name"])
-        if i < len(medals):
-            lines.append(f"{medals[i]} {name}  ⚔️ {row['power']}")
-        else:
-            lines.append(f"{i + 1}.  {name}  ⚔️ {row['power']}")
+        place = medals[i] if i < len(medals) else f"{i + 1}."
+        lines.append(f"{place} {name}  {mark} {row['value']}")
     return "\n".join(lines) + "</b>"
 
 
@@ -3258,8 +3281,31 @@ async def cmd_angry_battle(message: Message, pool: asyncpg.Pool):
 
 @router.message(Command("angrytop", ignore_case=True), GROUP_CHATS)
 async def cmd_angry_top(message: Message, bot: Bot, pool: asyncpg.Pool):
-    await message.reply(await perform_top(pool, message.chat.id))
+    await message.reply(
+        await perform_top(pool, message.chat.id, "power"),
+        reply_markup=top_kb("power", message.from_user.id),
+    )
     spawn_background_task(refresh_chat_tags(bot, pool, message.chat.id))
+
+
+@router.callback_query(F.data.startswith("top:"), GROUP_CALLBACKS)
+async def top_switch_cb(callback: CallbackQuery, pool: asyncpg.Pool):
+    _, metric, owner_id = callback.data.split(":")
+    if metric not in TOP_METRICS:
+        await callback.answer("Неизвестный лидерборд", show_alert=True)
+        return
+    if callback.from_user.id != int(owner_id):
+        await callback.answer("Это чужой лидерборд — вызови /AngryTop сам.", show_alert=True)
+        return
+    try:
+        await callback.message.edit_text(
+            await perform_top(pool, callback.message.chat.id, metric),
+            reply_markup=top_kb(metric, owner_id),
+        )
+    except TelegramBadRequest:
+        # Нажали на уже открытую вкладку — Telegram ругается на «не изменилось».
+        pass
+    await callback.answer()
 
 
 def is_info_word(text: str | None) -> bool:
