@@ -72,7 +72,7 @@ SETTINGS_SPEC = {
     "battle_cooldown_min": ("energy", "Кулдаун боя", "мин", 5, 1),
     "battle_energy_min": ("energy", "Энергии за бой (от)", "⚡", 3, 0),
     "battle_energy_max": ("energy", "Энергии за бой (до)", "⚡", 5, 0),
-    "casino_cooldown_min": ("casino", "Кулдаун ставки", "мин", 1, 0),
+    "casino_spins_per_min": ("casino", "Ставок в минуту", "шт", 3, 1),
     "casino_min_bet": ("casino", "Минимальная ставка", "монет", 10, 1),
     "casino_max_bet": ("casino", "Максимальная ставка (0 — без лимита)", "монет", 0, 0),
     "multi_x2_chance": ("multi", "Шанс ×2 крутки", "%", 10, 0),
@@ -460,6 +460,7 @@ SCHEMA_STATEMENTS = (
     """,
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS last_casino DOUBLE PRECISION NOT NULL DEFAULT 0",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS casino_spins INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_card_name TEXT",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_card_photo_id TEXT",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_card_power BIGINT",
@@ -1240,6 +1241,20 @@ async def clan_name_taken(pool: asyncpg.Pool, name: str) -> bool:
     return await get_clan_by_name(pool, name) is not None
 
 
+async def add_chat_money(
+    conn: asyncpg.Connection, chat_id: int, user_id: int, name: str, amount: int
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO chat_profiles (chat_id, user_id, name, money, opens)
+        VALUES ($1, $2, $3, $4, 0)
+        ON CONFLICT (chat_id, user_id) DO UPDATE SET
+            name = EXCLUDED.name, money = chat_profiles.money + EXCLUDED.money
+        """,
+        chat_id, user_id, name, amount,
+    )
+
+
 async def get_chat_money(pool: asyncpg.Pool, chat_id: int, user_id: int) -> int:
     money = await pool.fetchval(
         "SELECT money FROM chat_profiles WHERE chat_id = $1 AND user_id = $2", chat_id, user_id
@@ -1849,28 +1864,44 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[list[st
 
 # ── Казино ───────────────────────────────────────────────────────────────
 
-# Выпадает число 0–201. 201 — джекпот со своим шансом, остальные равновероятны,
-# а множитель ставки равен выпавшему числу, делённому на 100 (50 → ×0.50).
-CASINO_MAX_NUMBER = 200
-CASINO_JACKPOT_NUMBER = 201
-CASINO_JACKPOT_CHANCE = 0.005
-CASINO_JACKPOT_MULTIPLIER = 10
+# Крутим настоящую слот-машину Telegram: бот шлёт 🎰, а в ответе приходит
+# dice.value 1–64 — это три барабана, записанные числом по основанию 4.
+SLOT_SYMBOLS = ("bar", "grape", "lemon", "seven")
+SLOT_LABELS = {"bar": "BAR", "grape": "🍇", "lemon": "🍋", "seven": "7️⃣"}
+
+# Все множители — в сотых, чтобы считать выплату на целых числах.
+# Лесенка: чем «старше» символ, тем слабее он поодиночке и тем жирнее тройка.
+SLOT_SINGLE = {"grape": 20, "lemon": 15, "bar": 10, "seven": 5}
+SLOT_PAIR = {"grape": 100, "lemon": 85, "bar": 80, "seven": 30}
+SLOT_TRIPLE = {"grape": 250, "lemon": 350, "bar": 500, "seven": 1000}
+
+# Барабаны крутятся у игрока около двух секунд. Значение бот знает сразу,
+# поэтому ждём анимацию — иначе результат приходит раньше, чем слот встанет.
+SLOT_ANIMATION_SECONDS = 2
+
+# Лимит ставок: сколько их разрешено за это окно, задаётся в настройках.
+CASINO_WINDOW_SECONDS = 60
 
 
-def roll_casino() -> int:
-    if random.random() < CASINO_JACKPOT_CHANCE:
-        return CASINO_JACKPOT_NUMBER
-    return random.randint(0, CASINO_MAX_NUMBER)
+def decode_slot(value: int) -> tuple[str, str, str]:
+    v = value - 1
+    return SLOT_SYMBOLS[v % 4], SLOT_SYMBOLS[(v // 4) % 4], SLOT_SYMBOLS[(v // 16) % 4]
 
 
-def casino_payout(bet: int, number: int) -> int:
-    """Считаем на целых: bet * 1.16 во float даёт 115.999... и съедает монету."""
-    if number == CASINO_JACKPOT_NUMBER:
-        return bet * CASINO_JACKPOT_MULTIPLIER
-    return bet * number // 100
+def slot_multiplier(reels: tuple[str, str, str]) -> int:
+    """Множитель ставки в сотых: 100 = вернуть ставку."""
+    counts = {symbol: reels.count(symbol) for symbol in set(reels)}
+    top = max(counts, key=counts.get)
+    if counts[top] == 3:
+        return SLOT_TRIPLE[top]
+    if counts[top] == 2:
+        odd = next(symbol for symbol in reels if symbol != top)
+        return SLOT_PAIR[top] + SLOT_SINGLE[odd]
+    return sum(SLOT_SINGLE[symbol] for symbol in reels)
 
 
-async def perform_casino(pool: asyncpg.Pool, chat_id: int, user, bet: int) -> str:
+async def casino_take_bet(pool: asyncpg.Pool, chat_id: int, user, bet: int) -> str | None:
+    """Проверяет ставку и списывает её. Возвращает текст ошибки или None."""
     now = time.time()
     min_bet = max(1, setting("casino_min_bet"))
     max_bet = setting("casino_max_bet")
@@ -1888,36 +1919,64 @@ async def perform_casino(pool: asyncpg.Pool, chat_id: int, user, bet: int) -> st
             balance = profile["money"] if profile else 0
 
             player_row = await conn.fetchrow(
-                "SELECT last_casino FROM players WHERE user_id = $1 FOR UPDATE", user.id
+                "SELECT last_casino, casino_spins FROM players WHERE user_id = $1 FOR UPDATE", user.id
             )
-            last_casino = player_row["last_casino"] if player_row else 0
-            remaining = setting("casino_cooldown_min") * 60 - (now - last_casino)
-            if remaining > 0:
-                minutes, seconds = divmod(int(remaining), 60)
-                return f"<b>⏳ Казино ещё не остыло. Попробуй через {minutes} мин {seconds} сек.</b>"
+            window_start = player_row["last_casino"] if player_row else 0
+            spins = player_row["casino_spins"] if player_row else 0
+            if now - window_start >= CASINO_WINDOW_SECONDS:
+                window_start, spins = now, 0
+
+            limit = max(1, setting("casino_spins_per_min"))
+            if spins >= limit:
+                wait = int(CASINO_WINDOW_SECONDS - (now - window_start)) + 1
+                return f"<b>⏳ Не больше {limit} ставок в минуту. Подожди {wait} сек.</b>"
 
             if balance < bet:
                 return f"<b>{COIN_EMOJI} Не хватает монет. Ставка {bet}, у тебя {balance}.</b>"
 
-            number = roll_casino()
-            payout = casino_payout(bet, number)
-            delta = payout - bet
-
+            await add_chat_money(conn, chat_id, user.id, user.full_name, -bet)
             await conn.execute(
                 """
-                INSERT INTO chat_profiles (chat_id, user_id, name, money, opens)
-                VALUES ($1, $2, $3, $4, 0)
-                ON CONFLICT (chat_id, user_id) DO UPDATE SET
-                    name = EXCLUDED.name, money = chat_profiles.money + EXCLUDED.money
+                INSERT INTO players (user_id, name, last_casino, casino_spins)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    last_casino = EXCLUDED.last_casino,
+                    casino_spins = EXCLUDED.casino_spins
                 """,
-                chat_id, user.id, user.full_name, delta,
+                user.id, user.full_name, window_start, spins + 1,
             )
-            await set_player_cooldown(conn, user.id, user.full_name, "last_casino", now)
+    return None
 
-    banner = "🎉 <b>ДЖЕКПОТ!</b>\n\n" if number == CASINO_JACKPOT_NUMBER else ""
+
+async def casino_refund(pool: asyncpg.Pool, chat_id: int, user, bet: int) -> None:
+    """Возврат ставки, если слот не удалось прокрутить."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await add_chat_money(conn, chat_id, user.id, user.full_name, bet)
+            await conn.execute(
+                "UPDATE players SET casino_spins = GREATEST(casino_spins - 1, 0) WHERE user_id = $1",
+                user.id,
+            )
+
+
+async def casino_pay_out(pool: asyncpg.Pool, chat_id: int, user, bet: int, value: int) -> str:
+    reels = decode_slot(value)
+    payout = bet * slot_multiplier(reels) // 100
+
+    if payout:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await add_chat_money(conn, chat_id, user.id, user.full_name, payout)
+
+    if reels[0] == reels[1] == reels[2]:
+        banner = "🎉 <b>ДЖЕКПОТ!</b>\n\n" if reels[0] == "seven" else "✨ <b>ТРОЙКА!</b>\n\n"
+    else:
+        banner = ""
+    combo = " ".join(SLOT_LABELS[symbol] for symbol in reels)
     return (
         f"{banner}"
-        f"<b>Вам выпало число {number}</b>\n\n"
+        f"<b>Вам выпало {combo}</b>\n\n"
         f"<b>Ваш выигрыш {payout} {COIN_EMOJI}</b>"
     )
 
@@ -3269,13 +3328,29 @@ async def cmd_steal_word(message: Message, pool: asyncpg.Pool):
 
 
 async def handle_casino(message: Message, pool: asyncpg.Pool, raw_bet: str) -> None:
-    bet = (raw_bet or "").strip()
-    if not bet.isdigit():
+    raw = (raw_bet or "").strip()
+    if not raw.isdigit():
         await message.reply(
             "<b>🎰 Укажи ставку: /AngryCasino 100 или «казик 100»</b>"
         )
         return
-    await message.reply(await perform_casino(pool, message.chat.id, message.from_user, int(bet)))
+
+    bet = int(raw)
+    user = message.from_user
+    error = await casino_take_bet(pool, message.chat.id, user, bet)
+    if error:
+        await message.reply(error)
+        return
+
+    try:
+        slot = await message.reply_dice(emoji="🎰")
+    except TelegramAPIError:
+        await casino_refund(pool, message.chat.id, user, bet)
+        await message.reply("<b>🎰 Слот заело — ставка возвращена, попробуй ещё раз.</b>")
+        return
+
+    await asyncio.sleep(SLOT_ANIMATION_SECONDS)
+    await message.reply(await casino_pay_out(pool, message.chat.id, user, bet, slot.dice.value))
 
 
 @router.message(Command("angrycasino", ignore_case=True), GROUP_CHATS)
