@@ -2368,20 +2368,42 @@ INDEX_KINDS = {
 }
 
 
-async def index_text(pool: asyncpg.Pool, kind: str, page: int) -> tuple[str, int, int]:
+async def owned_card_ids(pool: asyncpg.Pool, user_id: int, kind: str) -> set[int]:
+    rows = await pool.fetch(
+        "SELECT card_id FROM inventory WHERE user_id = $1 AND kind = $2 AND qty > 0",
+        user_id, "card" if kind == "item" else "class",
+    )
+    return {row["card_id"] for row in rows}
+
+
+async def index_text(pool: asyncpg.Pool, kind: str, page: int, user_id: int) -> tuple[str, int, int]:
     cards = await (list_cards(pool) if kind == "item" else list_class_cards(pool))
     pages = max(1, (len(cards) + INDEX_PAGE_SIZE - 1) // INDEX_PAGE_SIZE)
     page = max(0, min(page, pages - 1))
     if not cards:
         return f"<b>{INDEX_KINDS[kind][1]}</b>\n\n<b>📭 Пока пусто.</b>", page, pages
 
-    lines = [f"<b>{INDEX_KINDS[kind][1]} — всего {len(cards)}</b>", "━━━━━━━━━━━━━━", ""]
+    owned = await owned_card_ids(pool, user_id, kind)
+    lines = [
+        f"<b>{INDEX_KINDS[kind][1]} — открыто {len(owned)} из {len(cards)}</b>",
+        "━━━━━━━━━━━━━━",
+        "",
+    ]
     chunk = cards[page * INDEX_PAGE_SIZE:(page + 1) * INDEX_PAGE_SIZE]
     for number, card in enumerate(chunk, start=page * INDEX_PAGE_SIZE + 1):
-        stats = f"⚔️ {card['power']}"
-        if kind == "item":
-            stats += f" · {COIN_EMOJI} {card['money']}"
-        lines.append(f"<b>{number}. {card_title(card)}</b> {rarity_display(card['rarity'])}")
+        # У невыбитых прячем название и цифры, но оставляем звёзды и птицу —
+        # чтобы было видно, за чем именно охотиться.
+        if card["id"] in owned:
+            title = f"✅ {card_title(card)}"
+            stats = f"⚔️ {card['power']}"
+            if kind == "item":
+                stats += f" · {COIN_EMOJI} {card['money']}"
+        else:
+            title = f"🔒 ??? ({bird_html(card['bird'])})"
+            stats = "⚔️ ?"
+            if kind == "item":
+                stats += f" · {COIN_EMOJI} ?"
+        lines.append(f"<b>{number}. {title}</b> {rarity_display(card['rarity'])}")
         lines.append(f"<b>     {stats}</b>")
     return "\n".join(lines), page, pages
 
@@ -2401,7 +2423,7 @@ def index_kb(kind: str, page: int, pages: int):
 @router.message(Command("index", ignore_case=True), F.chat.type == "private")
 async def cmd_index(message: Message, state: FSMContext, pool: asyncpg.Pool):
     await state.clear()
-    text, page, pages = await index_text(pool, "item", 0)
+    text, page, pages = await index_text(pool, "item", 0, message.from_user.id)
     await message.answer(text, reply_markup=index_kb("item", page, pages))
 
 
@@ -2416,7 +2438,7 @@ async def index_page_cb(callback: CallbackQuery, pool: asyncpg.Pool):
     if kind not in INDEX_KINDS:
         await callback.answer("Неизвестный раздел", show_alert=True)
         return
-    text, page, pages = await index_text(pool, kind, int(raw_page))
+    text, page, pages = await index_text(pool, kind, int(raw_page), callback.from_user.id)
     markup = index_kb(kind, page, pages)
     try:
         await callback.message.edit_text(text, reply_markup=markup)
