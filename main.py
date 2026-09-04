@@ -263,7 +263,7 @@ def group_intro_text() -> str:
         "🥷 /AngrySteal — украсть монеты (в ответ на сообщение)\n"
         f"⚔️ /AngryBattle — сразиться с мобом ({setting('battle_energy_min')}-"
         f"{setting('battle_energy_max')}⚡, раз в {setting('battle_cooldown_min')} мин)\n"
-        "ℹ️ /AngryInfo — профиль игрока (в ответ на сообщение)\n"
+        "ℹ️ /AngryInfo или «инфо» — профиль игрока (в ответ на сообщение)\n"
         "🎰 /AngryCasino 100 — поставить 100 монет (или «казик 100»)\n"
         "🎒 /AngryInv — инвентарь: классы и предметы\n"
         "🏆 /AngryTop — топ силы чата\n\n"
@@ -3262,13 +3262,19 @@ async def cmd_angry_top(message: Message, bot: Bot, pool: asyncpg.Pool):
     spawn_background_task(refresh_chat_tags(bot, pool, message.chat.id))
 
 
-@router.message(Command("angryinfo", ignore_case=True), GROUP_CHATS)
-async def cmd_angry_info(message: Message, command: CommandObject, bot: Bot, pool: asyncpg.Pool):
+def is_info_word(text: str | None) -> bool:
+    """Слово «инфо» первым в сообщении. Именно первое слово целиком, иначе
+    триггер ловил бы «информация», «инфографика» и прочие безобидные фразы."""
+    parts = (text or "").strip().lower().split()
+    return bool(parts) and parts[0] == "инфо"
+
+
+async def handle_angry_info(message: Message, bot: Bot, pool: asyncpg.Pool, raw_arg: str) -> None:
     reply = message.reply_to_message
     if reply is not None and reply.from_user is not None:
         target = reply.from_user
     else:
-        arg = (command.args or "").strip().lstrip("@")
+        arg = (raw_arg or "").strip().lstrip("@")
         if arg:
             try:
                 target = await bot.get_chat(f"@{arg}")
@@ -3299,6 +3305,16 @@ async def cmd_angry_info(message: Message, command: CommandObject, bot: Bot, poo
         await message.reply_photo(best_class["photo_id"], caption=text)
     else:
         await message.reply(text)
+
+
+@router.message(Command("angryinfo", ignore_case=True), GROUP_CHATS)
+async def cmd_angry_info(message: Message, command: CommandObject, bot: Bot, pool: asyncpg.Pool):
+    await handle_angry_info(message, bot, pool, command.args or "")
+
+
+@router.message(GROUP_CHATS, F.text.func(is_info_word))
+async def cmd_angry_info_word(message: Message, bot: Bot, pool: asyncpg.Pool):
+    await handle_angry_info(message, bot, pool, (message.text or "").strip()[len("инфо"):])
 
 
 async def handle_steal(message: Message, pool: asyncpg.Pool) -> None:
