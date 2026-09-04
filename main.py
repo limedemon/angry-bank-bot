@@ -1962,7 +1962,8 @@ async def casino_refund(pool: asyncpg.Pool, chat_id: int, user, bet: int) -> Non
 
 async def casino_pay_out(pool: asyncpg.Pool, chat_id: int, user, bet: int, value: int) -> str:
     reels = decode_slot(value)
-    payout = bet * slot_multiplier(reels) // 100
+    multiplier = slot_multiplier(reels)
+    payout = bet * multiplier // 100
 
     if payout:
         async with pool.acquire() as conn:
@@ -1976,7 +1977,7 @@ async def casino_pay_out(pool: asyncpg.Pool, chat_id: int, user, bet: int, value
     combo = " ".join(SLOT_LABELS[symbol] for symbol in reels)
     return (
         f"{banner}"
-        f"<b>Вам выпало {combo}</b>\n\n"
+        f"<b>Вам выпало {combo} (×{multiplier / 100:g})</b>\n\n"
         f"<b>Ваш выигрыш {payout} {COIN_EMOJI}</b>"
     )
 
