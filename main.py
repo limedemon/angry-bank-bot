@@ -1857,11 +1857,17 @@ CASINO_JACKPOT_CHANCE = 0.005
 CASINO_JACKPOT_MULTIPLIER = 10
 
 
-def roll_casino() -> tuple[int, float]:
+def roll_casino() -> int:
     if random.random() < CASINO_JACKPOT_CHANCE:
-        return CASINO_JACKPOT_NUMBER, float(CASINO_JACKPOT_MULTIPLIER)
-    number = random.randint(0, CASINO_MAX_NUMBER)
-    return number, number / 100
+        return CASINO_JACKPOT_NUMBER
+    return random.randint(0, CASINO_MAX_NUMBER)
+
+
+def casino_payout(bet: int, number: int) -> int:
+    """Считаем на целых: bet * 1.16 во float даёт 115.999... и съедает монету."""
+    if number == CASINO_JACKPOT_NUMBER:
+        return bet * CASINO_JACKPOT_MULTIPLIER
+    return bet * number // 100
 
 
 async def perform_casino(pool: asyncpg.Pool, chat_id: int, user, bet: int) -> str:
@@ -1893,8 +1899,8 @@ async def perform_casino(pool: asyncpg.Pool, chat_id: int, user, bet: int) -> st
             if balance < bet:
                 return f"<b>{COIN_EMOJI} Не хватает монет. Ставка {bet}, у тебя {balance}.</b>"
 
-            number, multiplier = roll_casino()
-            payout = int(bet * multiplier)
+            number = roll_casino()
+            payout = casino_payout(bet, number)
             delta = payout - bet
 
             await conn.execute(
@@ -1908,25 +1914,11 @@ async def perform_casino(pool: asyncpg.Pool, chat_id: int, user, bet: int) -> st
             )
             await set_player_cooldown(conn, user.id, user.full_name, "last_casino", now)
 
-    new_balance = balance + delta
-    if delta > 0:
-        outcome = f"<b>📈 В плюсе на {delta} {COIN_EMOJI}</b>"
-    elif delta < 0:
-        outcome = f"<b>📉 В минусе на {-delta} {COIN_EMOJI}</b>"
-    else:
-        outcome = "<b>➖ Остался при своих</b>"
-
     banner = "🎉 <b>ДЖЕКПОТ!</b>\n\n" if number == CASINO_JACKPOT_NUMBER else ""
     return (
         f"{banner}"
-        f"<b>🎰 <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> идёт в казино!</b>\n"
-        f"<b>Ставка: {bet} {COIN_EMOJI}</b>\n"
-        "━━━━━━━━━━━━━━\n"
         f"<b>Вам выпало число {number}</b>\n\n"
-        f"<b>Ваш выигрыш {payout} {COIN_EMOJI}</b>\n"
-        "━━━━━━━━━━━━━━\n"
-        f"{outcome}\n"
-        f"<b>Баланс: {new_balance} {COIN_EMOJI}</b>"
+        f"<b>Ваш выигрыш {payout} {COIN_EMOJI}</b>"
     )
 
 
