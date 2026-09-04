@@ -614,6 +614,12 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS cleardata_log (
+        user_id BIGINT PRIMARY KEY,
+        cleared_at DOUBLE PRECISION NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS inventory (
         user_id BIGINT NOT NULL,
         kind TEXT NOT NULL,
@@ -1464,6 +1470,16 @@ def admin_menu_kb():
     return kb.as_markup()
 
 
+def admin_airdrop_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🎲 Случайный", callback_data="airdrop:run:random")
+    for code, label, _weight, icon in AIRDROP_TIERS:
+        kb.button(text=f"{icon} {label}", callback_data=f"airdrop:run:{code}")
+    kb.button(text="⬅️ Назад", callback_data="admin:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 def drop_menu_kb():
     kb = InlineKeyboardBuilder()
     for code, label, _weight, icon in AIRDROP_TIERS:
@@ -2187,6 +2203,233 @@ async def safe_edit_text(message: Message, text: str, reply_markup=None) -> None
         await message.answer(text, reply_markup=reply_markup)
 
 
+# ── Удаление своих данных (/cleardata) ───────────────────────────────────
+
+CLEARDATA_COOLDOWN_SECONDS = 3 * 24 * 60 * 60
+
+
+async def cleardata_remaining(pool: asyncpg.Pool, user_id: int) -> float:
+    last = await pool.fetchval("SELECT cleared_at FROM cleardata_log WHERE user_id = $1", user_id)
+    if not last:
+        return 0.0
+    return max(0.0, CLEARDATA_COOLDOWN_SECONDS - (time.time() - last))
+
+
+async def player_chat_ids(pool: asyncpg.Pool, user_id: int) -> list[int]:
+    rows = await pool.fetch("SELECT chat_id FROM chat_profiles WHERE user_id = $1", user_id)
+    return [row["chat_id"] for row in rows]
+
+
+async def player_is_in_any_top(pool: asyncpg.Pool, user_id: int, chat_ids: list[int]) -> bool:
+    """Попал ли игрок хоть в один лидерборд хоть одного своего чата."""
+    for chat_id in chat_ids:
+        for _label, _title, column, _mark, _empty in TOP_METRICS.values():
+            hit = await pool.fetchval(
+                f"""
+                SELECT 1 FROM (
+                    SELECT cp.user_id
+                    FROM chat_profiles cp
+                    JOIN players pl ON pl.user_id = cp.user_id
+                    WHERE cp.chat_id = $1 AND {column} > 0
+                    ORDER BY {column} DESC
+                    LIMIT {TOP_LIMIT}
+                ) top
+                WHERE top.user_id = $2
+                """,
+                chat_id, user_id,
+            )
+            if hit:
+                return True
+    return False
+
+
+async def wipe_player_data(pool: asyncpg.Pool, user_id: int) -> None:
+    """Стирает игрока целиком. Клан, который он создал, удаляется вместе с ним
+    (участники отвязываются каскадом) — иначе остался бы клан без владельца."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM clans WHERE creator_id = $1", user_id)
+            await conn.execute("DELETE FROM clan_members WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM inventory WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM member_tags WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM chat_profiles WHERE user_id = $1", user_id)
+            await conn.execute("DELETE FROM players WHERE user_id = $1", user_id)
+            await conn.execute(
+                """
+                INSERT INTO cleardata_log (user_id, cleared_at) VALUES ($1, $2)
+                ON CONFLICT (user_id) DO UPDATE SET cleared_at = EXCLUDED.cleared_at
+                """,
+                user_id, time.time(),
+            )
+
+
+async def announce_wipe(bot: Bot, chat_ids: list[int], name: str) -> None:
+    text = (
+        f"<b>🧹 {html.escape(name)} стёр все свои данные.</b>\n"
+        "<b>Сила, монеты, токены и инвентарь обнулены.</b>"
+    )
+    for chat_id in chat_ids:
+        try:
+            await bot.send_message(chat_id, text)
+        except TelegramAPIError as error:
+            logging.warning("Не удалось сообщить об очистке в чат %s: %s", chat_id, error)
+
+
+def cleardata_kb(step: int):
+    """Два шага подтверждения. На втором кнопка согласия стоит в другом месте,
+    чтобы её не нажали второй раз по инерции."""
+    kb = InlineKeyboardBuilder()
+    if step == 1:
+        kb.button(text="❌ Нет, оставить", callback_data="clear:cancel")
+        kb.button(text="✅ Да, стереть", callback_data="clear:step2")
+        kb.button(text="❌ Нет, оставить", callback_data="clear:cancel")
+    else:
+        kb.button(text="↩️ Передумал", callback_data="clear:cancel")
+        kb.button(text="↩️ Передумал", callback_data="clear:cancel")
+        kb.button(text="🗑 Стереть навсегда", callback_data="clear:confirm")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+@router.message(Command("cleardata", ignore_case=True), F.chat.type == "private")
+async def cmd_cleardata(message: Message, state: FSMContext, pool: asyncpg.Pool):
+    await state.clear()
+    remaining = await cleardata_remaining(pool, message.from_user.id)
+    if remaining > 0:
+        hours, minutes = divmod(int(remaining) // 60, 60)
+        days, hours = divmod(hours, 24)
+        await message.answer(
+            "<b>⏳ Стирать данные можно раз в 3 дня.</b>\n"
+            f"<b>Осталось ждать: {days} д {hours} ч {minutes} мин</b>"
+        )
+        return
+    await message.answer(
+        "<b>🗑 Удаление данных</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        "<b>Будет стёрто НАВСЕГДА:</b>\n"
+        "<b>• сила, монеты и токены во всех чатах</b>\n"
+        "<b>• инвентарь и лучшие карточки</b>\n"
+        "<b>• клан, если ты его создал — вместе с участниками</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        "<b>Отменить это будет нельзя. Уверен?</b>",
+        reply_markup=cleardata_kb(1),
+    )
+
+
+@router.callback_query(F.data == "clear:cancel", F.message.chat.type == "private")
+async def cleardata_cancel_cb(callback: CallbackQuery):
+    await safe_edit_text(callback.message, "<b>✅ Отменено — данные на месте.</b>")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "clear:step2", F.message.chat.type == "private")
+async def cleardata_step2_cb(callback: CallbackQuery):
+    await safe_edit_text(
+        callback.message,
+        "<b>🗑 Последнее подтверждение</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        "<b>Прогресс не восстановить — резервных копий нет.</b>\n"
+        "<b>Стереть данные снова можно будет только через 3 дня.</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        "<b>Точно стираем?</b>",
+        reply_markup=cleardata_kb(2),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "clear:confirm", F.message.chat.type == "private")
+async def cleardata_confirm_cb(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
+    user = callback.from_user
+    if await cleardata_remaining(pool, user.id) > 0:
+        await callback.answer("Стирать данные можно раз в 3 дня.", show_alert=True)
+        return
+
+    chat_ids = await player_chat_ids(pool, user.id)
+    was_in_top = await player_is_in_any_top(pool, user.id, chat_ids)
+    await wipe_player_data(pool, user.id)
+
+    if was_in_top and chat_ids:
+        spawn_background_task(announce_wipe(bot, chat_ids, user.full_name))
+
+    await safe_edit_text(
+        callback.message,
+        "<b>🗑 Данные стёрты.</b>\n\n"
+        "<b>Ты начинаешь с нуля — крути /AngryOpen в любой группе.</b>",
+    )
+    await callback.answer("Готово")
+
+
+# ── Индекс карточек ──────────────────────────────────────────────────────
+
+INDEX_PAGE_SIZE = 8
+INDEX_KINDS = {
+    "item": ("🐷 Предметы", "🐷 Индекс предметов"),
+    "class": ("🎓 Классы", "🎓 Индекс классов"),
+}
+
+
+async def index_text(pool: asyncpg.Pool, kind: str, page: int) -> tuple[str, int, int]:
+    cards = await (list_cards(pool) if kind == "item" else list_class_cards(pool))
+    pages = max(1, (len(cards) + INDEX_PAGE_SIZE - 1) // INDEX_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    if not cards:
+        return f"<b>{INDEX_KINDS[kind][1]}</b>\n\n<b>📭 Пока пусто.</b>", page, pages
+
+    lines = [f"<b>{INDEX_KINDS[kind][1]} — всего {len(cards)}</b>", "━━━━━━━━━━━━━━", ""]
+    chunk = cards[page * INDEX_PAGE_SIZE:(page + 1) * INDEX_PAGE_SIZE]
+    for number, card in enumerate(chunk, start=page * INDEX_PAGE_SIZE + 1):
+        stats = f"⚔️ {card['power']}"
+        if kind == "item":
+            stats += f" · {COIN_EMOJI} {card['money']}"
+        lines.append(f"<b>{number}. {card_title(card)}</b> {rarity_display(card['rarity'])}")
+        lines.append(f"<b>     {stats}</b>")
+    return "\n".join(lines), page, pages
+
+
+def index_kb(kind: str, page: int, pages: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️", callback_data=f"index:{kind}:{max(0, page - 1)}")
+    kb.button(text=f"{page + 1}/{pages}", callback_data="index:noop")
+    kb.button(text="▶️", callback_data=f"index:{kind}:{min(pages - 1, page + 1)}")
+    for code, (label, _title) in INDEX_KINDS.items():
+        mark = "• " if code == kind else ""
+        kb.button(text=f"{mark}{label}", callback_data=f"index:{code}:0")
+    kb.adjust(3, 2)
+    return kb.as_markup()
+
+
+@router.message(Command("index", ignore_case=True), F.chat.type == "private")
+async def cmd_index(message: Message, state: FSMContext, pool: asyncpg.Pool):
+    await state.clear()
+    text, page, pages = await index_text(pool, "item", 0)
+    await message.answer(text, reply_markup=index_kb("item", page, pages))
+
+
+@router.callback_query(F.data == "index:noop", F.message.chat.type == "private")
+async def index_noop_cb(callback: CallbackQuery):
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("index:"), F.message.chat.type == "private")
+async def index_page_cb(callback: CallbackQuery, pool: asyncpg.Pool):
+    _, kind, raw_page = callback.data.split(":")
+    if kind not in INDEX_KINDS:
+        await callback.answer("Неизвестный раздел", show_alert=True)
+        return
+    text, page, pages = await index_text(pool, kind, int(raw_page))
+    markup = index_kb(kind, page, pages)
+    try:
+        await callback.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest as error:
+        if "not modified" in str(error).lower():
+            pass  # ткнули в край списка или в уже открытую вкладку
+        else:
+            # Индекс могли открыть кнопкой из профиля, а профиль — это фото:
+            # такое сообщение edit_text превратить в текстовое не может.
+            await safe_edit_text(callback.message, text, reply_markup=markup)
+    await callback.answer()
+
+
 # ── Приватные сообщения (админ-панель) ───────────────────────────────────
 
 @router.message(Command("whoami", ignore_case=True), F.chat.type == "private")
@@ -2251,16 +2494,34 @@ async def admin_promo_cb(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
 
 
 @router.callback_query(F.data == "admin:airdrop", IsAdminPrivate())
-async def admin_airdrop_cb(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
+async def admin_airdrop_cb(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_edit_text(
+        callback.message,
+        "<b>🎁 Запустить аирдроп</b>\n\n"
+        "Выбери редкость — дроп такой редкости уйдёт во все группы сразу. "
+        "«Случайный» разыгрывает тир по обычным шансам, как в автоматическом цикле.",
+        reply_markup=admin_airdrop_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("airdrop:run:"), IsAdminPrivate())
+async def admin_airdrop_run_cb(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
+    tier = callback.data.split(":")[2]
+    if tier != "random" and tier not in AIRDROP_TIER_LABELS:
+        await callback.answer("Неизвестная редкость", show_alert=True)
+        return
     chats = await get_active_chats(pool)
     if not chats:
         await callback.answer("Бот пока не состоит ни в одной группе", show_alert=True)
         return
+    name = "случайной редкости" if tier == "random" else AIRDROP_TIER_LABELS[tier].lower()
     await callback.answer(
-        f"Запускаю аирдроп в {len(chats)} чат(ов). Дропы появятся в течение "
+        f"Запускаю аирдроп {name} в {len(chats)} чат(ов). Дропы появятся в течение "
         f"{AIRDROP_CHAT_STAGGER_MIN}-{AIRDROP_CHAT_STAGGER_MAX} сек."
     )
-    spawn_background_task(spawn_airdrop_cycle(bot, pool))
+    spawn_background_task(spawn_airdrop_cycle(bot, pool, None if tier == "random" else tier))
 
 
 @router.callback_query(F.data == "drop:menu", IsAdminPrivate())
@@ -3191,6 +3452,7 @@ def profile_kb(is_admin: bool):
     Кнопку web_app Telegram разрешает только в личке — в группах её нет."""
     builder = InlineKeyboardBuilder()
     builder.button(text="🎒 Инвентарь", web_app=WebAppInfo(url=WEBAPP_URL))
+    builder.button(text="📖 Индекс", callback_data="index:item:0")
     if is_admin:
         builder.button(text="⚙️ Админ-панель", callback_data="admin:menu")
     builder.adjust(1)
@@ -3826,7 +4088,9 @@ async def count_human_members(bot: Bot, chat_id: int) -> int | None:
     return max(0, total - bots)
 
 
-async def spawn_airdrop_in_chat(bot: Bot, pool: asyncpg.Pool, chat_id: int, chat_title: str) -> None:
+async def spawn_airdrop_in_chat(
+    bot: Bot, pool: asyncpg.Pool, chat_id: int, chat_title: str, forced_tier: str | None = None
+) -> None:
     await asyncio.sleep(random.uniform(AIRDROP_CHAT_STAGGER_MIN, AIRDROP_CHAT_STAGGER_MAX))
 
     members = await count_human_members(bot, chat_id)
@@ -3837,7 +4101,11 @@ async def spawn_airdrop_in_chat(bot: Bot, pool: asyncpg.Pool, chat_id: int, chat
         )
         return
 
-    code, label, icon = roll_airdrop_tier()
+    if forced_tier:
+        code = forced_tier
+        label, icon = AIRDROP_TIER_LABELS[code], AIRDROP_TIER_ICONS[code]
+    else:
+        code, label, icon = roll_airdrop_tier()
     airdrop_id = await pool.fetchval(
         "INSERT INTO airdrops (chat_id, message_id, tier, created_at) VALUES ($1, 0, $2, $3) RETURNING id",
         chat_id, code, time.time(),
@@ -3865,9 +4133,11 @@ async def spawn_airdrop_in_chat(bot: Bot, pool: asyncpg.Pool, chat_id: int, chat
     await notify_admin(bot, pool, text)
 
 
-async def spawn_airdrop_cycle(bot: Bot, pool: asyncpg.Pool) -> None:
+async def spawn_airdrop_cycle(bot: Bot, pool: asyncpg.Pool, forced_tier: str | None = None) -> None:
     for chat in await get_active_chats(pool):
-        spawn_background_task(spawn_airdrop_in_chat(bot, pool, chat["chat_id"], chat["title"]))
+        spawn_background_task(
+            spawn_airdrop_in_chat(bot, pool, chat["chat_id"], chat["title"], forced_tier)
+        )
 
 
 async def airdrop_spawn_loop(bot: Bot, pool: asyncpg.Pool) -> None:
@@ -4323,7 +4593,11 @@ async def start_webapp(bot: Bot, pool: asyncpg.Pool, token: str) -> web.AppRunne
 
 async def set_bot_commands(bot: Bot) -> None:
     await bot.set_my_commands(
-        [BotCommand(command="start", description="Открыть меню")],
+        [
+            BotCommand(command="start", description="Открыть меню"),
+            BotCommand(command="index", description="индекс предметов и классов"),
+            BotCommand(command="cleardata", description="стереть все свои данные"),
+        ],
         scope=BotCommandScopeAllPrivateChats(),
     )
     await bot.set_my_commands(
