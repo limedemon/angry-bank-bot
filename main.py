@@ -72,6 +72,9 @@ SETTINGS_SPEC = {
     "battle_cooldown_min": ("energy", "Кулдаун боя", "мин", 5, 1),
     "battle_energy_min": ("energy", "Энергии за бой (от)", "⚡", 3, 0),
     "battle_energy_max": ("energy", "Энергии за бой (до)", "⚡", 5, 0),
+    "casino_cooldown_min": ("casino", "Кулдаун ставки", "мин", 1, 0),
+    "casino_min_bet": ("casino", "Минимальная ставка", "монет", 10, 1),
+    "casino_max_bet": ("casino", "Максимальная ставка (0 — без лимита)", "монет", 0, 0),
     "multi_x2_chance": ("multi", "Шанс ×2 крутки", "%", 10, 0),
     "multi_x3_chance": ("multi", "Шанс ×3 крутки", "%", 5, 0),
 }
@@ -81,6 +84,7 @@ SETTINGS_SECTIONS = {
     "class": "🎓 Класс",
     "airdrop": "🎁 Аирдропы",
     "energy": "⚡ Энергия и бои",
+    "casino": "🎰 Казино",
     "multi": "🎲 Множители круток",
 }
 
@@ -260,6 +264,7 @@ def group_intro_text() -> str:
         f"⚔️ /AngryBattle — сразиться с мобом ({setting('battle_energy_min')}-"
         f"{setting('battle_energy_max')}⚡, раз в {setting('battle_cooldown_min')} мин)\n"
         "ℹ️ /AngryInfo — профиль игрока (в ответ на сообщение)\n"
+        "🎰 /AngryCasino 100 — поставить 100 монет (или «казик 100»)\n"
         "🎒 /AngryInv — инвентарь: классы и предметы\n"
         "🏆 /AngryTop — топ силы чата\n\n"
         f"🏰 /clancreate Название — создать клан ({CLAN_CREATE_COST} монет)\n"
@@ -304,6 +309,9 @@ MOB_FIELD_PROMPTS = {
 REGULAR_STAR_EMOJI_ID = "5224378646688474051"
 RAINBOW_STAR_EMOJI_ID = "5224307204202476701"
 ASTRAL_STAR_EMOJI_ID = "5233626046284212790"
+
+# Премиум-эмодзи монеты — та же, что и в остальных сообщениях бота.
+COIN_EMOJI = "<tg-emoji emoji-id='5224237406688944529'>🪙</tg-emoji>"
 
 # rarity code -> (кол-во звёзд, тип звезды)
 RARITY_INFO = {
@@ -451,6 +459,7 @@ SCHEMA_STATEMENTS = (
     )
     """,
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE players ADD COLUMN IF NOT EXISTS last_casino DOUBLE PRECISION NOT NULL DEFAULT 0",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_card_name TEXT",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_card_photo_id TEXT",
     "ALTER TABLE players ADD COLUMN IF NOT EXISTS best_card_power BIGINT",
@@ -1165,7 +1174,7 @@ async def ensure_player_name(conn: asyncpg.Connection, user_id: int, name: str) 
 
 
 async def set_player_cooldown(conn: asyncpg.Connection, user_id: int, name: str, field: str, timestamp: float) -> None:
-    if field not in ("last_open", "last_class"):
+    if field not in ("last_open", "last_class", "last_casino"):
         raise ValueError(f"Недопустимое поле кулдауна: {field}")
     await conn.execute(
         f"""
@@ -1836,6 +1845,89 @@ async def perform_class(pool: asyncpg.Pool, chat_id: int, user) -> tuple[list[st
         f"−{setting('class_spin_cost')} монет</b>"
     )
     return [card["photo_id"] for card in cards], caption
+
+
+# ── Казино ───────────────────────────────────────────────────────────────
+
+# Выпадает число 0–201. 201 — джекпот со своим шансом, остальные равновероятны,
+# а множитель ставки равен выпавшему числу, делённому на 100 (50 → ×0.50).
+CASINO_MAX_NUMBER = 200
+CASINO_JACKPOT_NUMBER = 201
+CASINO_JACKPOT_CHANCE = 0.005
+CASINO_JACKPOT_MULTIPLIER = 10
+
+
+def roll_casino() -> tuple[int, float]:
+    if random.random() < CASINO_JACKPOT_CHANCE:
+        return CASINO_JACKPOT_NUMBER, float(CASINO_JACKPOT_MULTIPLIER)
+    number = random.randint(0, CASINO_MAX_NUMBER)
+    return number, number / 100
+
+
+async def perform_casino(pool: asyncpg.Pool, chat_id: int, user, bet: int) -> str:
+    now = time.time()
+    min_bet = max(1, setting("casino_min_bet"))
+    max_bet = setting("casino_max_bet")
+    if bet < min_bet:
+        return f"<b>🎰 Минимальная ставка — {min_bet} {COIN_EMOJI}</b>"
+    if max_bet and bet > max_bet:
+        return f"<b>🎰 Максимальная ставка — {max_bet} {COIN_EMOJI}</b>"
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            profile = await conn.fetchrow(
+                "SELECT money FROM chat_profiles WHERE chat_id = $1 AND user_id = $2 FOR UPDATE",
+                chat_id, user.id,
+            )
+            balance = profile["money"] if profile else 0
+
+            player_row = await conn.fetchrow(
+                "SELECT last_casino FROM players WHERE user_id = $1 FOR UPDATE", user.id
+            )
+            last_casino = player_row["last_casino"] if player_row else 0
+            remaining = setting("casino_cooldown_min") * 60 - (now - last_casino)
+            if remaining > 0:
+                minutes, seconds = divmod(int(remaining), 60)
+                return f"<b>⏳ Казино ещё не остыло. Попробуй через {minutes} мин {seconds} сек.</b>"
+
+            if balance < bet:
+                return f"<b>{COIN_EMOJI} Не хватает монет. Ставка {bet}, у тебя {balance}.</b>"
+
+            number, multiplier = roll_casino()
+            payout = int(bet * multiplier)
+            delta = payout - bet
+
+            await conn.execute(
+                """
+                INSERT INTO chat_profiles (chat_id, user_id, name, money, opens)
+                VALUES ($1, $2, $3, $4, 0)
+                ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                    name = EXCLUDED.name, money = chat_profiles.money + EXCLUDED.money
+                """,
+                chat_id, user.id, user.full_name, delta,
+            )
+            await set_player_cooldown(conn, user.id, user.full_name, "last_casino", now)
+
+    new_balance = balance + delta
+    if delta > 0:
+        outcome = f"<b>📈 В плюсе на {delta} {COIN_EMOJI}</b>"
+    elif delta < 0:
+        outcome = f"<b>📉 В минусе на {-delta} {COIN_EMOJI}</b>"
+    else:
+        outcome = "<b>➖ Остался при своих</b>"
+
+    banner = "🎉 <b>ДЖЕКПОТ!</b>\n\n" if number == CASINO_JACKPOT_NUMBER else ""
+    return (
+        f"{banner}"
+        f"<b>🎰 <a href='tg://user?id={user.id}'>{html.escape(user.full_name)}</a> идёт в казино!</b>\n"
+        f"<b>Ставка: {bet} {COIN_EMOJI}</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"<b>Вам выпало число {number}</b>\n\n"
+        f"<b>Ваш выигрыш {payout} {COIN_EMOJI}</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"{outcome}\n"
+        f"<b>Баланс: {new_balance} {COIN_EMOJI}</b>"
+    )
 
 
 async def perform_steal(pool: asyncpg.Pool, chat_id: int, thief, target) -> str:
@@ -3184,6 +3276,26 @@ async def cmd_steal_word(message: Message, pool: asyncpg.Pool):
     await handle_steal(message, pool)
 
 
+async def handle_casino(message: Message, pool: asyncpg.Pool, raw_bet: str) -> None:
+    bet = (raw_bet or "").strip()
+    if not bet.isdigit():
+        await message.reply(
+            "<b>🎰 Укажи ставку: /AngryCasino 100 или «казик 100»</b>"
+        )
+        return
+    await message.reply(await perform_casino(pool, message.chat.id, message.from_user, int(bet)))
+
+
+@router.message(Command("angrycasino", ignore_case=True), GROUP_CHATS)
+async def cmd_casino(message: Message, command: CommandObject, pool: asyncpg.Pool):
+    await handle_casino(message, pool, command.args or "")
+
+
+@router.message(GROUP_CHATS, F.text.func(lambda t: (t or "").strip().lower().startswith("казик")))
+async def cmd_casino_word(message: Message, pool: asyncpg.Pool):
+    await handle_casino(message, pool, (message.text or "").strip()[len("казик"):])
+
+
 @router.callback_query(F.data == "group:open", GROUP_CALLBACKS)
 async def cb_group_open(callback: CallbackQuery, pool: asyncpg.Pool):
     photos, text = await perform_open(pool, callback.message.chat.id, callback.from_user)
@@ -4097,6 +4209,7 @@ async def set_bot_commands(bot: Bot) -> None:
             BotCommand(command="clan", description="инфо о клане"),
             BotCommand(command="angryinfo", description="профиль игрока (в ответ на сообщение)"),
             BotCommand(command="angrybattle", description="сразиться с мобом"),
+            BotCommand(command="angrycasino", description="поставить монеты в казино"),
             BotCommand(command="angryinv", description="инвентарь: классы и предметы"),
             BotCommand(command="angrytop", description="открыть лидерборд"),
         ],
