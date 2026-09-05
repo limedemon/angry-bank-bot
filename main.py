@@ -1952,6 +1952,14 @@ SLOT_SINGLE = {"grape": 50, "lemon": 20, "bar": 10, "seven": 5}
 SLOT_PAIR = {"grape": 100, "lemon": 130, "bar": 50, "seven": 20}
 SLOT_TRIPLE = {"grape": 200, "lemon": 250, "bar": 300, "seven": 500}
 
+# Три самые слабые комбинации сгорают полностью — ставка не возвращается вообще.
+# Ключ — набор символов без учёта порядка барабанов.
+SLOT_ZERO_COMBOS = {
+    ("bar", "seven", "seven"),
+    ("bar", "lemon", "seven"),
+    ("lemon", "seven", "seven"),
+}
+
 # Барабаны крутятся у игрока около двух секунд. Значение бот знает сразу,
 # поэтому ждём анимацию — иначе результат приходит раньше, чем слот встанет.
 SLOT_ANIMATION_SECONDS = 2
@@ -1967,6 +1975,8 @@ def decode_slot(value: int) -> tuple[str, str, str]:
 
 def slot_multiplier(reels: tuple[str, str, str]) -> int:
     """Множитель ставки в сотых: 100 = вернуть ставку."""
+    if tuple(sorted(reels)) in SLOT_ZERO_COMBOS:
+        return 0
     counts = {symbol: reels.count(symbol) for symbol in set(reels)}
     top = max(counts, key=counts.get)
     if counts[top] == 3:
