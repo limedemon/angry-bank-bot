@@ -567,6 +567,9 @@ SCHEMA_STATEMENTS = (
     SELECT chat_id, chat_title FROM chat_owners
     ON CONFLICT (chat_id) DO NOTHING
     """,
+    "ALTER TABLE bot_chats ADD COLUMN IF NOT EXISTS username TEXT",
+    "ALTER TABLE bot_chats ADD COLUMN IF NOT EXISTS invite_link TEXT",
+    "ALTER TABLE bot_chats ADD COLUMN IF NOT EXISTS link_updated_at DOUBLE PRECISION NOT NULL DEFAULT 0",
     """
     CREATE TABLE IF NOT EXISTS airdrops (
         id SERIAL PRIMARY KEY,
@@ -672,7 +675,9 @@ async def get_active_chat_ids(pool: asyncpg.Pool) -> list[int]:
 
 
 async def get_active_chats(pool: asyncpg.Pool) -> list[dict]:
-    rows = await pool.fetch("SELECT chat_id, title FROM bot_chats ORDER BY title")
+    rows = await pool.fetch(
+        "SELECT chat_id, title, username, invite_link, link_updated_at FROM bot_chats ORDER BY title"
+    )
     return [dict(row) for row in rows]
 
 
@@ -681,6 +686,57 @@ def group_link(chat_id: int) -> str | None:
     if s.startswith("-100"):
         return f"https://t.me/c/{s[4:]}"
     return None
+
+
+def chat_open_url(chat: dict) -> str | None:
+    """Ссылка, по которой админ реально попадёт в группу.
+
+    t.me/c/<id> открывается только у тех, кто уже состоит в чате, — поэтому
+    сначала берём публичный @username, потом пригласительную ссылку, и лишь
+    в последнюю очередь внутреннюю."""
+    if chat.get("username"):
+        return f"https://t.me/{chat['username']}"
+    if chat.get("invite_link"):
+        return chat["invite_link"]
+    return group_link(chat["chat_id"])
+
+
+CHAT_LINK_TTL = 6 * 60 * 60
+
+
+async def refresh_chat_link(bot: Bot, pool: asyncpg.Pool, chat_id: int) -> None:
+    """Забирает у Telegram @username и уже существующую пригласительную ссылку.
+    Новую ссылку не создаём: exportChatInviteLink отзывает старую, а её могли
+    раздать людям."""
+    try:
+        chat = await bot.get_chat(chat_id)
+    except TelegramAPIError as error:
+        logging.warning("Не удалось получить данные чата %s: %s", chat_id, error)
+        return
+    await pool.execute(
+        """
+        UPDATE bot_chats
+        SET title = COALESCE($2, title), username = $3, invite_link = $4, link_updated_at = $5
+        WHERE chat_id = $1
+        """,
+        chat_id, chat.title, chat.username, chat.invite_link, time.time(),
+    )
+
+
+async def refresh_stale_chat_links(bot: Bot, pool: asyncpg.Pool, chats: list[dict], force: bool = False) -> None:
+    cutoff = time.time() - CHAT_LINK_TTL
+    stale = [c for c in chats if force or (c.get("link_updated_at") or 0) < cutoff]
+    if not stale:
+        return
+    # Групп могут быть десятки: дёргать getChat для всех разом — верный способ
+    # поймать флуд-лимит, поэтому пропускаем их пачками.
+    limit = asyncio.Semaphore(8)
+
+    async def guarded(chat_id: int) -> None:
+        async with limit:
+            await refresh_chat_link(bot, pool, chat_id)
+
+    await asyncio.gather(*(guarded(c["chat_id"]) for c in stale))
 
 
 def group_message_link(chat_id: int, message_id: int) -> str | None:
@@ -1570,11 +1626,15 @@ def settings_section_text(section: str) -> str:
 def chats_list_kb(chats: list[dict]):
     kb = InlineKeyboardBuilder()
     for chat in chats:
-        link = group_link(chat["chat_id"])
+        link = chat_open_url(chat)
+        # Публичные и приглашённые открываются у всех, внутренняя t.me/c — только
+        # у участников, поэтому помечаем её, чтобы было понятно, почему не пускает.
+        mark = "" if (chat.get("username") or chat.get("invite_link")) else "🔒 "
         if link:
-            kb.button(text=chat["title"], url=link)
+            kb.button(text=f"{mark}{chat['title']}", url=link)
         else:
-            kb.button(text=chat["title"], callback_data=f"chats:info:{chat['chat_id']}")
+            kb.button(text=f"🔒 {chat['title']}", callback_data=f"chats:info:{chat['chat_id']}")
+    kb.button(text="🔄 Обновить ссылки", callback_data="chats:refresh")
     kb.button(text="⬅️ Назад", callback_data="admin:menu")
     kb.adjust(1)
     return kb.as_markup()
@@ -2493,18 +2553,35 @@ async def admin_menu_cb(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data == "chats:menu", IsAdminPrivate())
-async def chats_menu_cb(callback: CallbackQuery, pool: asyncpg.Pool):
+async def show_chats_menu(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool, force: bool) -> None:
     chats = await get_active_chats(pool)
     if not chats:
         await callback.answer("Бот пока не состоит ни в одной группе", show_alert=True)
         return
-    await safe_edit_text(
-        callback.message,
-        f"<b>🌐 Группы бота ({len(chats)})</b>\n\nНажми на группу, чтобы перейти в неё.",
-        reply_markup=chats_list_kb(chats),
-    )
+    await refresh_stale_chat_links(bot, pool, chats, force)
+    chats = await get_active_chats(pool)
+    locked = sum(1 for c in chats if not (c.get("username") or c.get("invite_link")))
+
+    text = f"<b>🌐 Группы бота ({len(chats)})</b>\n\nНажми на группу, чтобы перейти в неё."
+    if locked:
+        text += (
+            f"\n\n<b>🔒 {locked} — без публичной ссылки.</b> Такие открываются только "
+            "у участников группы. Ссылка появится, если у группы есть @юзернейм или "
+            "если бота сделать админом с правом приглашать."
+        )
+    await safe_edit_text(callback.message, text, reply_markup=chats_list_kb(chats))
+
+
+@router.callback_query(F.data == "chats:menu", IsAdminPrivate())
+async def chats_menu_cb(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
+    await show_chats_menu(callback, bot, pool, force=False)
     await callback.answer()
+
+
+@router.callback_query(F.data == "chats:refresh", IsAdminPrivate())
+async def chats_refresh_cb(callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool):
+    await callback.answer("Обновляю ссылки...")
+    await show_chats_menu(callback, bot, pool, force=True)
 
 
 @router.callback_query(F.data == "admin:promo", IsAdminPrivate())
@@ -2753,7 +2830,9 @@ async def settings_edit_value(message: Message, state: FSMContext, pool: asyncpg
 async def chats_info_cb(callback: CallbackQuery):
     chat_id = callback.data.split(":")[2]
     await callback.answer(
-        f"ID чата: {chat_id}\n(обычная группа — прямая ссылка недоступна, только супергруппы)",
+        f"ID чата: {chat_id}\n\nСсылки нет: группа не публичная (нет @юзернейма), "
+        "а пригласительную ссылку бот не видит — для неё его нужно сделать "
+        "админом с правом приглашать участников.",
         show_alert=True,
     )
 
